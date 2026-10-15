@@ -82,6 +82,22 @@ references`. Other unknown UUIDs, and a reference also passed in
 `uuids` property description now name both arguments. Argument types and
 response shapes are unchanged.
 
+## Unreleased: `export_pdf` and `export_svg` default to the front view (patch release)
+
+Both tools documented an omitted or empty `layers` as "all visible layers", but
+passed no layer list to `kicad-cli`, which refuses that with "At least one layer
+must be specified". `kicad-cli` has no visible-layers option, so the
+documented default never worked.
+
+An omitted or empty `layers` now plots the board's front view on one page:
+whichever of F.Cu, F.Mask, F.SilkS, and Edge.Cuts the board declares, drawn
+in that order so the silkscreen sits on top. Inner
+and back copper are left out, because every copper layer on one page cannot
+be read. Pass `layers` for any other view. Both responses now include the
+`layers` that were plotted, as `export_gerber`'s already does. A `layers` item
+that is not a string is refused as `invalid_argument` instead of being dropped
+(#465).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
