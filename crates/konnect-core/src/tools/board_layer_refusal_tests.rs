@@ -233,11 +233,7 @@ async fn a_known_layer_still_reaches_kicad_as_that_layer() {
         ("add_board_text", None, BoardLayer::BlFSilkS),
         ("add_board_text", Some("B.SilkS"), BoardLayer::BlBSilkS),
         // Over IPC an alias is the enum value, so it stays accepted (#126).
-        (
-            "add_board_text",
-            Some("F.Silkscreen"),
-            BoardLayer::BlFSilkS,
-        ),
+        ("add_board_text", Some("F.Silkscreen"), BoardLayer::BlFSilkS),
         ("import_svg_logo", None, BoardLayer::BlFSilkS),
         ("import_svg_logo", Some("F.Cu"), BoardLayer::BlFCu),
         ("add_zone", Some("In1.Cu"), BoardLayer::BlIn1Cu),

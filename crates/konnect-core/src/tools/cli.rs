@@ -1424,14 +1424,7 @@ fn netlist_format(format: &str) -> String {
 /// [`netlist_format`].
 fn netlist_args<'a>(output: &'a str, v10_format: &'a str, schematic: &'a str) -> [&'a str; 8] {
     [
-        "sch",
-        "export",
-        "netlist",
-        "--output",
-        output,
-        "--format",
-        v10_format,
-        schematic,
+        "sch", "export", "netlist", "--output", output, "--format", v10_format, schematic,
     ]
 }
 

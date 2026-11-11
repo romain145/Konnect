@@ -2890,14 +2890,7 @@ pub(crate) async fn add_zone_impl(
         )));
     };
     let zone_sexp = format_zone_polygon(
-        &net,
-        file_layer,
-        clearance,
-        min_width,
-        &points,
-        &zone_name,
-        priority,
-        connection,
+        &net, file_layer, clearance, min_width, &points, &zone_name, priority, connection,
     );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());

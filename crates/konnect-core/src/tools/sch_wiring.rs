@@ -2176,8 +2176,7 @@ async fn handle_add_power_symbol(
         "" => DEFAULT_POWER_PREFIX,
         prefix => prefix,
     };
-    let pwr_ref =
-        super::sch_annotate::format_designator(prefix, next_power_number(&sch, prefix));
+    let pwr_ref = super::sch_annotate::format_designator(prefix, next_power_number(&sch, prefix));
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
