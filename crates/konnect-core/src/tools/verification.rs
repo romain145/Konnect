@@ -24,9 +24,11 @@ pub fn tools() -> Vec<ToolDef> {
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
              complete configured DRC ruleset; kicad-cli has no per-test selector. \
-             `ignored_checks` names the checks whose severity is ignore: they were not run, \
-             so no violation count covers them (see `get_drc_severities` / \
-             `set_drc_severities`).",
+             `by_rule` counts errors and warnings per rule over everything at or above \
+             `severity`, so a rule that fills the listing does not hide the others; pass \
+             `rules` to list only some of them. `ignored_checks` names the checks whose \
+             severity is ignore: they were not run, so no violation count covers them (see \
+             `get_drc_severities` / `set_drc_severities`).",
             json!({
                 "type": "object",
                 "properties": {
@@ -43,6 +45,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Maximum number of violations to return",
                         "default": 50
+                    },
+                    "rules": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "List only violations of these rule keys (a violation's `rule`, the keys of `by_rule`), e.g. [\"clearance\", \"silk_overlap\"]. Omit to list every rule. The summary counts, `by_rule` included, are not narrowed by it."
                     }
                 },
                 "required": ["board"]
@@ -296,6 +304,11 @@ async fn handle_run_drc(
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    // Refused before DRC runs: a mistyped filter should not cost a KiCad run.
+    let rules_filter = match rules_argument(args) {
+        Ok(rules) => rules,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -320,8 +333,38 @@ async fn handle_run_drc(
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
-    let shown = filtered.len().min(limit);
-    let truncated = filtered.len() > limit;
+    // Counted over everything at this severity, before `rules` and `limit`
+    // narrow the listing: when one rule fills the listing, this is the only
+    // place the others show at all (#188).
+    let mut by_rule = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+    for violation in &filtered {
+        let counts = by_rule.entry(violation.rule.as_str()).or_default();
+        match violation.severity.as_str() {
+            "error" => counts.0 += 1,
+            "warning" => counts.1 += 1,
+            _ => {}
+        }
+    }
+    let by_rule: serde_json::Map<String, Value> = by_rule
+        .into_iter()
+        .map(|(rule, (errors, warnings))| {
+            (
+                rule.to_string(),
+                json!({ "errors": errors, "warnings": warnings }),
+            )
+        })
+        .collect();
+    // `rules` chooses what is listed. The counts above stay whole, so the
+    // caller still sees what it filtered out.
+    let listed: Vec<_> = filtered
+        .iter()
+        .filter(|violation| match &rules_filter {
+            Some(rules) => rules.contains(&violation.rule.as_str()),
+            None => true,
+        })
+        .collect();
+    let shown = listed.len().min(limit);
+    let truncated = listed.len() > limit;
     let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
@@ -351,9 +394,11 @@ async fn handle_run_drc(
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
+            "by_rule": by_rule,
+            "rules_filter": rules_filter,
             "shown": shown,
             "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
+            "violations": listed.iter().take(limit).map(|v| json!({
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,
@@ -363,6 +408,34 @@ async fn handle_run_drc(
         }))
         .unwrap(),
     ))
+}
+
+/// `run_drc`'s optional `rules` include list: the rule keys whose violations
+/// to list. Absent means every rule.
+fn rules_argument(args: &Value) -> Result<Option<Vec<&str>>, CallToolResult> {
+    let rules = match args.get("rules") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(rules) => rules.as_array().ok_or_else(|| {
+            crate::tools::invalid_arg("rules", "not an array of rule keys such as 'clearance'")
+        })?,
+    };
+    // An empty list would list nothing and look like a clean board.
+    if rules.is_empty() {
+        return Err(crate::tools::invalid_arg(
+            "rules",
+            "empty; name at least one rule key, or omit `rules` to list every rule",
+        ));
+    }
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            rule.as_str().ok_or_else(|| {
+                crate::tools::invalid_arg(&format!("rules[{index}]"), "not a string")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Write a report, creating the directory the caller named.

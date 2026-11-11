@@ -128,3 +128,174 @@ async fn a_report_without_the_list_is_null_not_empty() {
     let none = run_drc_on(&report_with("ignored_checks", Some(json!([]))), json!({})).await;
     assert_eq!(none["ignored_checks"], json!([]), "{none}");
 }
+
+// ─── #188: a count per rule ──────────────────────────────────────────────────
+
+/// The table in this file's header, as `by_rule`.
+fn fixture_by_rule() -> Value {
+    json!({
+        "copper_edge_clearance": { "errors": 5, "warnings": 0 },
+        "lib_footprint_issues": { "errors": 0, "warnings": 1 },
+        "silk_edge_clearance": { "errors": 0, "warnings": 1 }
+    })
+}
+
+fn listed_rules(body: &Value) -> Vec<&str> {
+    body["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|violation| violation["rule"].as_str().unwrap())
+        .collect()
+}
+
+/// The issue's situation in small: one rule fills the listing. With
+/// `limit: 2` both entries shown are `copper_edge_clearance`, and `by_rule`
+/// is the only place the other two rules appear.
+#[tokio::test]
+async fn by_rule_counts_every_rule_however_short_the_listing() {
+    let body = run_drc_on(REPORT, json!({ "limit": 2 })).await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(body["by_rule"], fixture_by_rule(), "{body}");
+    assert_eq!(
+        listed_rules(&body),
+        ["copper_edge_clearance", "copper_edge_clearance"]
+    );
+    assert_eq!(body["shown"], 2);
+    assert_eq!(body["truncated"], true);
+    // The per-rule counts add up to the totals beside them.
+    assert_eq!(body["errors"], 5);
+    assert_eq!(body["warnings"], 2);
+    assert_eq!(body["filtered_count"], 7);
+    assert_eq!(body["rules_filter"], Value::Null);
+}
+
+/// `by_rule` is counted over the same set as `errors` and `warnings`: the
+/// severity filter applies to it, so a rule with only warnings drops out at
+/// `severity: error`.
+#[tokio::test]
+async fn by_rule_follows_the_severity_filter() {
+    let body = run_drc_on(REPORT, json!({ "severity": "error" })).await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(
+        body["by_rule"],
+        json!({ "copper_edge_clearance": { "errors": 5, "warnings": 0 } })
+    );
+    assert_eq!(body["errors"], 5);
+    assert_eq!(body["warnings"], 0);
+}
+
+/// Every category is counted, not only `violations`: an unrouted net is
+/// reported under `unconnected_items` with the rule of that name (#245).
+#[tokio::test]
+async fn by_rule_counts_unconnected_items_too() {
+    let unconnected = json!([{
+        "type": "unconnected_items",
+        "severity": "error",
+        "description": "Missing connection between items",
+        "items": []
+    }]);
+    let report = report_with("unconnected_items", Some(unconnected));
+
+    let body = run_drc_on(&report, json!({})).await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(
+        body["by_rule"]["unconnected_items"],
+        json!({ "errors": 1, "warnings": 0 })
+    );
+    assert_eq!(body["by_rule"]["copper_edge_clearance"]["errors"], 5);
+}
+
+/// `rules` lists only the named rules, and the limit then applies to those.
+/// The summary is not narrowed: it still says what was left out.
+#[tokio::test]
+async fn rules_lists_only_the_named_rules_and_leaves_the_counts_whole() {
+    let body = run_drc_on(
+        REPORT,
+        json!({ "rules": ["silk_edge_clearance", "lib_footprint_issues"], "limit": 5 }),
+    )
+    .await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    let mut listed = listed_rules(&body);
+    listed.sort_unstable();
+    assert_eq!(listed, ["lib_footprint_issues", "silk_edge_clearance"]);
+    assert_eq!(body["shown"], 2);
+    assert_eq!(body["truncated"], false);
+    assert_eq!(
+        body["rules_filter"],
+        json!(["silk_edge_clearance", "lib_footprint_issues"])
+    );
+    assert_eq!(body["by_rule"], fixture_by_rule(), "{body}");
+    assert_eq!(body["filtered_count"], 7);
+    assert_eq!(body["errors"], 5);
+}
+
+/// `truncated` describes the listing `rules` selected, not the whole report.
+#[tokio::test]
+async fn truncation_is_measured_on_the_listed_rules() {
+    let all = run_drc_on(
+        REPORT,
+        json!({ "rules": ["copper_edge_clearance"], "limit": 5 }),
+    )
+    .await;
+    assert_eq!(all["shown"], 5, "{all}");
+    assert_eq!(all["truncated"], false, "{all}");
+
+    let cut = run_drc_on(
+        REPORT,
+        json!({ "rules": ["copper_edge_clearance"], "limit": 4 }),
+    )
+    .await;
+    assert_eq!(cut["shown"], 4, "{cut}");
+    assert_eq!(cut["truncated"], true, "{cut}");
+}
+
+/// A rule nothing broke lists nothing, and `by_rule` shows that the board is
+/// not clean for all that.
+#[tokio::test]
+async fn a_rule_with_no_violations_lists_nothing_beside_whole_counts() {
+    let body = run_drc_on(REPORT, json!({ "rules": ["clearance"] })).await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(body["violations"], json!([]));
+    assert_eq!(body["shown"], 0);
+    assert_eq!(body["by_rule"], fixture_by_rule());
+}
+
+/// A malformed `rules` is refused by name. An empty list would otherwise list
+/// nothing and read as a clean board.
+#[tokio::test]
+async fn a_malformed_rules_filter_is_refused_by_name() {
+    for (bad, field) in [
+        (json!([]), "rules"),
+        (json!("clearance"), "rules"),
+        (json!(["clearance", 3]), "rules[1]"),
+    ] {
+        let body = run_drc_on(REPORT, json!({ "rules": bad })).await;
+        assert_eq!(body["isError"], true, "{bad}: {body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{bad}: {body}");
+        assert_eq!(body["error"]["field"], field, "{bad}: {body}");
+    }
+}
+
+/// The handler holds the same line when reached without the served schema.
+#[test]
+fn the_handler_checks_the_rules_filter_itself() {
+    assert_eq!(rules_argument(&json!({})).unwrap(), None);
+    assert_eq!(
+        rules_argument(&json!({ "rules": ["clearance"] })).unwrap(),
+        Some(vec!["clearance"])
+    );
+    for bad in [json!([]), json!("clearance"), json!(["clearance", 3])] {
+        let refusal = rules_argument(&json!({ "rules": bad })).unwrap_err();
+        assert!(refusal.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refusal).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+}
