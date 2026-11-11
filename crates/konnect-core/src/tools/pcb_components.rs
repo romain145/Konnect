@@ -413,13 +413,90 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
         let rot = num(3).unwrap_or(0.0);
         if let (Some(x), Some(y)) = (x, y) {
             match name {
-                "Reference" => placement.reference_at = Some((x, y, rot)),
-                "Value" => placement.value_at = Some((x, y, rot)),
+                "Reference" => {
+                    placement.reference_at = Some((x, y, rot));
+                    placement.reference_style = field_style(prop);
+                }
+                "Value" => {
+                    placement.value_at = Some((x, y, rot));
+                    placement.value_style = field_style(prop);
+                }
                 _ => {}
             }
         }
     }
     placement
+}
+
+/// How the library draws one field: its layer, visibility, font, justification
+/// and keep-upright, so the placed field saves back as the library wrote it
+/// (#201).
+///
+/// A clause the property leaves out gets the value KiCad itself assumes when
+/// it reads the file: 1 mm glyphs, no thickness, single line spacing, centered,
+/// kept upright. `None` only when the property names no layer, which leaves
+/// nothing to place the text on.
+fn field_style(property: &konnect_sexp::SexpNode) -> Option<konnect_ipc::IpcFieldStyle> {
+    use konnect_ipc::gen::kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+    let layer = property.find_str("layer")?.to_string();
+    let effects = property.find("effects");
+    let font = effects.and_then(|effects| effects.find("font"));
+    let yes = |node: Option<&konnect_sexp::SexpNode>, tag: &str| {
+        node.is_some_and(|node| {
+            node.find_str(tag) == Some("yes")
+                // KiCad 7 and earlier wrote the flag as a bare atom.
+                || node
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|child| child.as_str() == Some(tag))
+        })
+    };
+
+    let mut horizontal_alignment = HorizontalAlignment::HaCenter;
+    let mut vertical_alignment = VerticalAlignment::VaCenter;
+    let mut mirrored = false;
+    if let Some(justify) = effects.and_then(|effects| effects.find("justify")) {
+        for value in justify.children().unwrap_or_default().iter().skip(1) {
+            match value.as_str() {
+                Some("left") => horizontal_alignment = HorizontalAlignment::HaLeft,
+                Some("right") => horizontal_alignment = HorizontalAlignment::HaRight,
+                Some("top") => vertical_alignment = VerticalAlignment::VaTop,
+                Some("bottom") => vertical_alignment = VerticalAlignment::VaBottom,
+                Some("mirror") => mirrored = true,
+                _ => {}
+            }
+        }
+    }
+
+    let size = font.and_then(|font| font.find("size"));
+    // The file writes `(size height width)`.
+    let height = size.and_then(|size| size.get_f64(1)).unwrap_or(1.0);
+    let width = size.and_then(|size| size.get_f64(2)).unwrap_or(height);
+    Some(konnect_ipc::IpcFieldStyle {
+        layer,
+        visible: !text_hidden(property),
+        size: (width, height),
+        thickness_mm: font
+            .and_then(|font| font.find_f64("thickness"))
+            .filter(|thickness| *thickness > 0.0),
+        line_spacing: font
+            .and_then(|font| font.find_f64("line_spacing"))
+            .filter(|spacing| *spacing > 0.0)
+            .unwrap_or(1.0),
+        font_face: font
+            .and_then(|font| font.find_str("face"))
+            .unwrap_or_default()
+            .to_string(),
+        bold: yes(font, "bold"),
+        italic: yes(font, "italic"),
+        horizontal_alignment,
+        vertical_alignment,
+        mirrored,
+        // The file only ever states the opposite of keep-upright.
+        keep_upright: !yes(Some(property), "unlocked"),
+    })
 }
 
 pub(crate) fn extract_graphic_definitions(
@@ -7025,6 +7102,12 @@ mod tests {
 #[cfg(test)]
 mod field_placement_tests {
     use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board;
+    use konnect_ipc::gen::kiapi;
+    use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+    use konnect_ipc::gen::kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn field_anchors_come_from_the_library_footprint() {
@@ -7049,6 +7132,241 @@ mod field_placement_tests {
         let placement = extract_field_placement("(footprint \"bare\")");
         assert_eq!(placement.reference_at, None);
         assert_eq!(placement.value_at, None);
+        assert_eq!(placement.reference_style, None);
+        assert_eq!(placement.value_style, None);
+    }
+
+    /// Unmodified `Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod` from
+    /// KiCad 10's standard library: the footprint #201 was reported on.
+    const C_0603: &str = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+
+    /// What the stock footprint's `(effects (font (size 1 1) (thickness 0.15)))`
+    /// with no `(unlocked yes)`, `(hide yes)` or `(justify …)` comes to.
+    fn stock_style(layer: &str) -> konnect_ipc::IpcFieldStyle {
+        konnect_ipc::IpcFieldStyle {
+            layer: layer.to_string(),
+            visible: true,
+            size: (1.0, 1.0),
+            thickness_mm: Some(0.15),
+            line_spacing: 1.0,
+            font_face: String::new(),
+            bold: false,
+            italic: false,
+            horizontal_alignment: HorizontalAlignment::HaCenter,
+            vertical_alignment: VerticalAlignment::VaCenter,
+            mirrored: false,
+            keep_upright: true,
+        }
+    }
+
+    #[test]
+    fn field_styles_come_from_the_stock_library_footprint() {
+        let placement = extract_field_placement(C_0603);
+
+        assert_eq!(placement.reference_style, Some(stock_style("F.SilkS")));
+        // The library shows the Value on the fabrication layer; the placed
+        // part used to carry it hidden on the silkscreen.
+        assert_eq!(placement.value_style, Some(stock_style("F.Fab")));
+    }
+
+    /// The clauses the stock capacitor does not use, in a property KiCad
+    /// 10.0.6 wrote: the `Datasheet` field of `MH4` in
+    /// `crates/konnect-ipc/tests/fixtures/live_ipc.kicad_pcb`, quoted whole
+    /// apart from its UUID. `(unlocked yes)` is how the file says keep-upright
+    /// is off.
+    #[test]
+    fn unlocked_hidden_and_sized_clauses_are_read_from_a_kicad_written_property() {
+        let source = "(footprint \"MountingHole_2.7mm_M2.5_DIN965\"
+	(property \"Reference\" \"\"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer \"F.Fab\")
+		(hide yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+)";
+        let style = extract_field_placement(source).reference_style.unwrap();
+
+        assert!(!style.keep_upright);
+        assert!(!style.visible);
+        assert_eq!(style.layer, "F.Fab");
+        assert_eq!(style.size, (1.27, 1.27));
+        assert_eq!(style.thickness_mm, Some(0.15));
+    }
+
+    /// A field with no `(thickness …)`, as KiCad 10.0.5 wrote the `Datasheet`
+    /// of `R1` in `tests/fixtures/specctra_two_resistors.kicad_pcb`, has no
+    /// thickness to copy, and justification is read where it is stated.
+    #[test]
+    fn an_absent_thickness_stays_absent_and_justification_is_read() {
+        let source = "(footprint \"R_0402\"
+	(property \"Value\" \"\"
+		(at 0 0 0)
+		(layer \"F.Fab\")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom mirror)
+		)
+	)
+)";
+        let style = extract_field_placement(source).value_style.unwrap();
+
+        assert_eq!(style.thickness_mm, None);
+        assert_eq!(style.line_spacing, 1.0);
+        assert_eq!(style.horizontal_alignment, HorizontalAlignment::HaLeft);
+        assert_eq!(style.vertical_alignment, VerticalAlignment::VaBottom);
+        assert!(style.mirrored);
+    }
+
+    /// A KiCad holding `board` that keeps whatever `CreateItems` sends and
+    /// lists it back, so `place_component` finds the part it placed.
+    fn kicad_keeping_created_items(
+        board: &Path,
+        created: Arc<Mutex<Vec<prost_types::Any>>>,
+    ) -> crate::test_support::MockIpcServer {
+        spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: created.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if !command.type_url.ends_with("CreateItems") {
+                return None;
+            }
+            let request =
+                kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
+            created.lock().unwrap().extend(request.items.clone());
+            Some(konnect_ipc::builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: request
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            ))
+        })
+    }
+
+    /// The issue's reproduction through served `tools/call`: the stock 0603
+    /// capacitor placed as `C11` at (20, 30) rotated 180 degrees on a live
+    /// board. The fields KiCad is sent must be the library's.
+    ///
+    /// The oracle for the text attributes is KiCad itself:
+    /// `issue_474_r1.ipc.bin` is KiCad 10's own IPC message for a footprint
+    /// whose Reference is saved with the same clauses as the stock library's,
+    /// `(layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)))`
+    /// (see `tests/fixtures/issue_474_ipc.README.md`). A field built from the
+    /// library must carry the attributes KiCad reports for that one.
+    #[tokio::test]
+    async fn place_component_sends_the_librarys_reference_and_value_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let library = dir.path().join("Capacitor_SMD.pretty");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(library.join("C_0603_1608Metric.kicad_mod"), C_0603).unwrap();
+        std::fs::write(
+            dir.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let kicad = kicad_keeping_created_items(&board, created.clone());
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: kicad.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 201, "method": "tools/call",
+                "params": { "name": "place_component", "arguments": {
+                    "board": board.to_string_lossy(),
+                    "footprint": "Capacitor_SMD:C_0603_1608Metric",
+                    "reference": "C11", "x": 20.0, "y": 30.0, "rotation": 180.0
+                }}
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("a result")).expect("an MCP result");
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let created = created.lock().unwrap();
+        assert_eq!(created.len(), 1, "one footprint is created");
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(created[0].value.as_slice()).unwrap();
+        let captured = kiapi::board::types::FootprintInstance::decode(
+            &include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin")[..],
+        )
+        .unwrap();
+        let attributes = |field: &Option<kiapi::board::types::Field>| {
+            field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.attributes.clone())
+                .expect("the field has text attributes")
+        };
+        let kicad_attributes = attributes(&captured.reference_field);
+        // The capture is the oracle only while it says what the issue says
+        // KiCad holds for these clauses.
+        assert!(kicad_attributes.keep_upright);
+        assert_eq!(kicad_attributes.line_spacing, 1.0);
+        assert_eq!(kicad_attributes.stroke_width.unwrap().value_nm, 150_000);
+
+        for (name, field, layer, local_y) in [
+            (
+                "Reference",
+                &footprint.reference_field,
+                BoardLayer::BlFSilkS,
+                -1.43,
+            ),
+            ("Value", &footprint.value_field, BoardLayer::BlFFab, 1.43),
+        ] {
+            let placed = field.as_ref().unwrap();
+            let board_text = placed.text.as_ref().unwrap();
+            assert!(placed.visible, "{name}: the library shows it");
+            assert_eq!(board_text.layer, layer as i32, "{name}");
+            // Rotated 180 degrees about (20, 30), the library's (0, y) lands
+            // at (20, 30 - y).
+            let position = board_text.text.as_ref().unwrap().position.unwrap();
+            assert_eq!(
+                (position.x_nm, position.y_nm),
+                (20_000_000, konnect_ipc::builders::mm_to_nm(30.0 - local_y)),
+                "{name}"
+            );
+            assert_eq!(attributes(field), kicad_attributes, "{name}");
+        }
     }
 }
 

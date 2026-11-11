@@ -4033,7 +4033,34 @@ impl KiCadIpcClient {
             })?;
         }
 
-        let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
+        // A footprint with no library behind it (inline geometry) has no
+        // field style to copy. Its fields then sit on the silkscreen of the
+        // footprint's side with only the Reference shown, drawn with KiCad's
+        // defaults for footprint text.
+        let silk = if layer == "B.Cu" {
+            "B.SilkS"
+        } else {
+            "F.SilkS"
+        };
+        let reference_style = fields
+            .reference_style
+            .clone()
+            .unwrap_or_else(|| crate::types::IpcFieldStyle::kicad_default(silk, true));
+        let value_style = fields
+            .value_style
+            .clone()
+            .unwrap_or_else(|| crate::types::IpcFieldStyle::kicad_default(silk, false));
+        // Same refusal as the pads and graphics above, for the same crash.
+        for (name, style) in [("Reference", &reference_style), ("Value", &value_style)] {
+            crate::builders::try_layer_from_name(&style.layer).with_context(|| {
+                format!("footprint '{lib_id}' has a {name} field this build cannot place")
+            })?;
+        }
+
+        let text_field = |name: &str,
+                          text: &str,
+                          local: (f64, f64, f64),
+                          style: &crate::types::IpcFieldStyle| {
             // Field text positions come footprint-local from the library and
             // are transformed exactly like pads, so the placed part keeps the
             // library's text layout instead of a synthesized offset that can
@@ -4047,39 +4074,58 @@ impl KiCadIpcClient {
                     id: None,
                     text: Some(kiapi::common::types::Text {
                         position: Some(crate::builders::vec2(bx, by)),
+                        // Every member is stated. A member left at the
+                        // protobuf default is not "KiCad's default": KiCad
+                        // saved `keep_upright: false` as `(unlocked yes)`, a
+                        // zero `line_spacing` as `(line_spacing 0)` and a
+                        // missing `stroke_width` as no thickness (#201).
                         attributes: Some(kiapi::common::types::TextAttributes {
-                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            font_name: style.font_face.clone(),
+                            horizontal_alignment: style.horizontal_alignment as i32,
+                            vertical_alignment: style.vertical_alignment as i32,
                             angle: Some(kiapi::common::types::Angle {
                                 value_degrees: readable_text_angle(rotation + frot),
                             }),
-                            ..Default::default()
+                            line_spacing: style.line_spacing,
+                            // Absent stays absent: a library field with no
+                            // `(thickness …)` has none on the board either.
+                            stroke_width: style.thickness_mm.map(crate::builders::distance),
+                            italic: style.italic,
+                            bold: style.bold,
+                            underlined: false,
+                            // `visible` (deprecated since KiCad 9.0.1, when
+                            // visibility moved to `Field.visible` below) and
+                            // `multiline` are not in the file. Both are what
+                            // KiCad 10 reports for a footprint field it read
+                            // from one (`issue_474_r1.ipc.bin`).
+                            visible: true,
+                            mirrored: style.mirrored,
+                            multiline: true,
+                            keep_upright: style.keep_upright,
+                            size: Some(crate::builders::vec2(style.size.0, style.size.1)),
                         }),
                         text: text.to_string(),
                         hyperlink: String::new(),
                     }),
-                    layer: crate::builders::layer_from_name(if layer == "B.Cu" {
-                        "B.SilkS"
-                    } else {
-                        "F.SilkS"
-                    }) as i32,
+                    layer: crate::builders::layer_from_name(&style.layer) as i32,
                     knockout: false,
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     parent: None,
                 }),
-                visible,
+                visible: style.visible,
             }
         };
         let reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
-            true,
+            &reference_style,
         );
         let value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
-            false,
+            &value_style,
         );
         let mut child_items: Vec<prost_types::Any> = pads
             .iter()
@@ -6246,6 +6292,114 @@ mod footprint_graphics_tests {
                 .value_degrees,
             90.0
         );
+    }
+
+    /// #201: a footprint with no library behind it (inline geometry) still
+    /// gets fields KiCad saves cleanly. Left at the protobuf defaults they
+    /// were saved as `(unlocked yes)`, no thickness and `(line_spacing 0)`.
+    #[test]
+    fn fields_without_a_library_style_use_kicads_defaults_not_protobufs() {
+        let fp = build(&[], 100.0, 50.0, 0.0);
+
+        for (field, visible) in [(&fp.reference_field, true), (&fp.value_field, false)] {
+            let field = field.as_ref().unwrap();
+            assert_eq!(field.visible, visible, "{}", field.name);
+            let text = field.text.as_ref().unwrap();
+            assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
+            let attributes = text.text.as_ref().unwrap().attributes.as_ref().unwrap();
+            assert!(attributes.keep_upright, "{}", field.name);
+            assert_eq!(attributes.line_spacing, 1.0, "{}", field.name);
+            assert_eq!(attributes.stroke_width.unwrap().value_nm, 150_000);
+            assert_eq!(attributes.size.unwrap().x_nm, 1_000_000);
+            assert_eq!(attributes.size.unwrap().y_nm, 1_000_000);
+        }
+    }
+
+    /// #201: a field the library describes is built as described, on the
+    /// library's layer, and a field with no thickness is sent without one.
+    #[test]
+    fn a_library_field_style_is_sent_as_given() {
+        use crate::types::{IpcFieldPlacement, IpcFieldStyle};
+        use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+        let style = IpcFieldStyle {
+            layer: "F.Fab".to_string(),
+            visible: true,
+            size: (0.8, 1.2),
+            thickness_mm: None,
+            line_spacing: 1.5,
+            font_face: "Arial".to_string(),
+            bold: true,
+            italic: true,
+            horizontal_alignment: HorizontalAlignment::HaLeft,
+            vertical_alignment: VerticalAlignment::VaTop,
+            mirrored: true,
+            keep_upright: false,
+        };
+        let any = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            &[],
+            &IpcFieldPlacement {
+                value_style: Some(style),
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+
+        let value = fp.value_field.unwrap();
+        assert!(value.visible);
+        let text = value.text.unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let attributes = text.text.unwrap().attributes.unwrap();
+        assert_eq!(attributes.size.unwrap().x_nm, 800_000);
+        assert_eq!(attributes.size.unwrap().y_nm, 1_200_000);
+        assert_eq!(attributes.stroke_width, None);
+        assert_eq!(attributes.line_spacing, 1.5);
+        assert_eq!(attributes.font_name, "Arial");
+        assert!(attributes.bold && attributes.italic && attributes.mirrored);
+        assert_eq!(
+            attributes.horizontal_alignment(),
+            HorizontalAlignment::HaLeft
+        );
+        assert_eq!(attributes.vertical_alignment(), VerticalAlignment::VaTop);
+        assert!(!attributes.keep_upright);
+        // The definition carries the same field as the instance.
+        assert_eq!(
+            fp.definition
+                .unwrap()
+                .value_field
+                .unwrap()
+                .text
+                .unwrap()
+                .layer,
+            kiapi::board::types::BoardLayer::BlFFab as i32
+        );
+
+        let unknown = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            &[],
+            &IpcFieldPlacement {
+                reference_style: Some(IpcFieldStyle::kicad_default("F.Silk", true)),
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap_err();
+        assert!(format!("{unknown:#}").contains("Reference"), "{unknown:#}");
     }
 
     /// At 180° the text would read upside down; KiCAD keeps labels readable by

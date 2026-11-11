@@ -2567,6 +2567,7 @@ async fn handle_add_mounting_hole(
             konnect_ipc::IpcFieldPlacement {
                 reference_at: Some((0.0, text_offset, 0.0)),
                 value_at: Some((0.0, -text_offset, 0.0)),
+                ..Default::default()
             },
             format_npth_footprint(x, y, &spec),
         ),
@@ -4955,6 +4956,7 @@ mod mounting_hole_name_tests {
             konnect_ipc::IpcFieldPlacement {
                 reference_at: Some((0.0, text_offset, 0.0)),
                 value_at: Some((0.0, -text_offset, 0.0)),
+                ..Default::default()
             },
             format_npth_footprint(5.0, 6.0, &spec),
         );

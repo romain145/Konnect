@@ -651,12 +651,79 @@ pub enum UnavailableReason {
 /// from the library footprint so placed parts keep the library's text
 /// positions. A hardcoded offset put the Reference on top of the part's own
 /// silkscreen (silk_overlap DRC warnings in live verification).
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `reference_style`/`value_style` carry how the library draws each field.
+/// Without them a placed part's fields were built from protobuf defaults, which
+/// KiCad saved as `(unlocked yes)`, no font thickness and `(line_spacing 0)`,
+/// with the Value hidden on the silkscreen instead of shown on `F.Fab` (#201).
+#[derive(Debug, Clone, Default)]
 pub struct IpcFieldPlacement {
     /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
     pub reference_at: Option<(f64, f64, f64)>,
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
     pub value_at: Option<(f64, f64, f64)>,
+    /// The library's presentation of the Reference text. `None` when the
+    /// footprint did not come from a library (inline geometry).
+    pub reference_style: Option<IpcFieldStyle>,
+    /// The library's presentation of the Value text.
+    pub value_style: Option<IpcFieldStyle>,
+}
+
+/// How a library footprint draws one of its fields: everything a
+/// `(property …)` states besides its text and `(at …)`.
+///
+/// Each member holds what KiCad reads from the file, including KiCad's own
+/// value for a clause the file leaves out, so the placed field saves back as
+/// the library wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcFieldStyle {
+    /// KiCad layer name from `(layer …)`.
+    pub layer: String,
+    /// False for `(hide yes)`.
+    pub visible: bool,
+    /// Glyph (width, height) in mm from `(font (size h w))`.
+    pub size: (f64, f64),
+    /// `(font (thickness …))` in mm. `None` when the library names none, which
+    /// KiCad keeps as a zero thickness and draws at a width derived from the
+    /// glyph size.
+    pub thickness_mm: Option<f64>,
+    /// `(font (line_spacing …))`; KiCad's value when absent is 1.
+    pub line_spacing: f64,
+    /// `(font (face …))`; empty for KiCad's built-in stroke font.
+    pub font_face: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// `(justify left|right)`; centered when absent.
+    pub horizontal_alignment: crate::gen::kiapi::common::types::HorizontalAlignment,
+    /// `(justify top|bottom)`; centered when absent.
+    pub vertical_alignment: crate::gen::kiapi::common::types::VerticalAlignment,
+    /// `(justify mirror)`.
+    pub mirrored: bool,
+    /// KiCad's "keep upright". The file states only the opposite, as
+    /// `(unlocked yes)`, so this is true unless that clause is present.
+    pub keep_upright: bool,
+}
+
+impl IpcFieldStyle {
+    /// The style a field gets when no library describes it: KiCad's own
+    /// defaults for footprint text (1 mm glyphs, 0.15 mm thickness, single
+    /// line spacing, centered, kept upright) on `layer`.
+    pub fn kicad_default(layer: &str, visible: bool) -> Self {
+        Self {
+            layer: layer.to_string(),
+            visible,
+            size: (1.0, 1.0),
+            thickness_mm: Some(0.15),
+            line_spacing: 1.0,
+            font_face: String::new(),
+            bold: false,
+            italic: false,
+            horizontal_alignment: crate::gen::kiapi::common::types::HorizontalAlignment::HaCenter,
+            vertical_alignment: crate::gen::kiapi::common::types::VerticalAlignment::VaCenter,
+            mirrored: false,
+            keep_upright: true,
+        }
+    }
 }
 
 /// A three-component value as KiCad's `Vector3D` message carries it.
