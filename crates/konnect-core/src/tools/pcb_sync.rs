@@ -217,6 +217,21 @@ struct SyncPlan {
     /// Not part of the plan's identity: `sync_response` reports it.
     #[serde(skip)]
     staging: Option<StagingEvidence>,
+    /// Pad fabrication properties the planned additions' library footprints
+    /// carry and the board will not (#193). Reported by `sync_response`
+    /// beside the diagnostics that explain it; not part of the plan's
+    /// identity, because it follows from the footprints the plan names.
+    #[serde(skip)]
+    dropped_pad_properties: Vec<DroppedPadProperties>,
+}
+
+/// One library footprint the plan adds whose pads carry a fabrication
+/// property the board will not have, with every part placed from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DroppedPadProperties {
+    footprint_id: String,
+    references: Vec<String>,
+    pads: Vec<super::pad_fabrication::PadWithProperty>,
 }
 
 /// What added footprints were staged beside (#688).
@@ -283,6 +298,9 @@ struct PreparedFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     fields: konnect_ipc::IpcFieldPlacement,
+    /// Library pads that carry a `(property pad_prop_…)`. KiCad 10's `Pad`
+    /// message has no field for it, so these are what an addition loses.
+    pad_properties: Vec<super::pad_fabrication::PadWithProperty>,
     /// The library's `(attr …)`: mounting style and exclusion flags.
     attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
     /// The library's description and keywords, which KiCad keeps on the
@@ -396,6 +414,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             refresh_revision_with_staging(&mut plan);
 
             if dry_run || plan.status == PlanStatus::Conflict {
+                note_dropped_pad_properties(&mut plan, &prepared, false);
                 let status = match plan.status {
                     PlanStatus::Ready => "ready",
                     PlanStatus::Noop => "noop",
@@ -439,6 +458,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     None,
                 ));
             }
+            note_dropped_pad_properties(&mut plan, &prepared, true);
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
             plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
@@ -504,6 +524,10 @@ fn sync_response(
         },
         "changes": plan.changes,
         "diagnostics": plan.diagnostics,
+        // Library pad fabrication properties the added footprints do not
+        // carry, per footprint, with every pad (#193). Each entry also has a
+        // `pad_fabrication_property_dropped` diagnostic saying why.
+        "dropped_pad_properties": plan.dropped_pad_properties,
         // Schematic components with no footprint: reported per part with what
         // the board holds for them, never planned and never fatal (#507). A
         // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
@@ -900,6 +924,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
+        // Set by the handler once the library footprints are read.
+        dropped_pad_properties: Vec::new(),
     }
 }
 
@@ -2004,11 +2030,13 @@ fn prepare_footprint_source(
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
+    let pad_properties = super::pad_fabrication::pads_with_property(&root);
     let (width, height) = footprint_dimensions(&pads, &graphics);
     Ok(PreparedFootprint {
         pads,
         graphics,
         fields,
+        pad_properties,
         attributes,
         description_and_keywords,
         models,
@@ -2125,6 +2153,116 @@ fn additions_missing_pads(
         }
     }
     diagnostics
+}
+
+/// Say which pad fabrication properties the plan's additions lose (#193).
+///
+/// A library pad's `(property pad_prop_heatsink)` and its siblings have no
+/// field in KiCad 10's `Pad` message (`board_types.proto` reserves ID 12 for
+/// KiCad 11), so a footprint created through the API reaches the board without
+/// them however it is built. The sync used to say nothing: the plan was
+/// `ready`, the apply reported no diagnostics, and the first sign was KiCad's
+/// DRC reporting `lib_footprint_mismatch` for every QFN and BGA on the board.
+///
+/// This is a warning, not a refusal. Refusing would stop any board with an
+/// exposed pad or a BGA from syncing at all, while KiCad's own Tools → Update
+/// Footprints from Library puts the properties back. So the status and the
+/// conflict count are left alone; one diagnostic per library footprint names
+/// its parts and pads, and `dropped_pad_properties` lists every pad.
+///
+/// The readback cannot confirm any of this, for the same reason the property
+/// cannot be sent: KiCad does not report it either. The message says so
+/// rather than leaving the caller to infer the board was checked.
+fn note_dropped_pad_properties(
+    plan: &mut SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+    applied: bool,
+) {
+    let mut dropped: BTreeMap<&str, DroppedPadProperties> = BTreeMap::new();
+    for change in &plan.changes {
+        let PlannedChange::Add {
+            footprint_id,
+            reference,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        let Some(part) = prepared
+            .get(footprint_id)
+            .filter(|part| !part.pad_properties.is_empty())
+        else {
+            continue;
+        };
+        dropped
+            .entry(footprint_id)
+            .or_insert_with(|| DroppedPadProperties {
+                footprint_id: footprint_id.clone(),
+                references: Vec::new(),
+                pads: part.pad_properties.clone(),
+            })
+            .references
+            .push(reference.clone());
+    }
+    let dropped = dropped.into_values().collect::<Vec<_>>();
+    for entry in &dropped {
+        let (placed, sent) = if applied {
+            ("was placed", "they were not sent and cannot be read back")
+        } else {
+            ("will be placed", "they cannot be sent or read back")
+        };
+        plan.diagnostics.push(footprint_conflict(
+            "pad_fabrication_property_dropped",
+            format!(
+                "{} (used by {}) {placed} without its pads' fabrication properties: {}. \
+                 KiCad 10's IPC API has no field for a pad's fabrication property, so \
+                 {sent}. Nothing else about the footprint is affected and the sync is \
+                 not refused, but KiCad's DRC reports lib_footprint_mismatch for these \
+                 parts and fabrication outputs treat the pads as ordinary ones until \
+                 KiCad's Tools → Update Footprints from Library restores them.",
+                entry.footprint_id,
+                listed(&entry.references),
+                summarized_pad_properties(&entry.pads),
+            ),
+            &entry.footprint_id,
+            entry.references.clone(),
+        ));
+    }
+    plan.dropped_pad_properties = dropped;
+}
+
+/// `heatsink on 1 pad (29); mechanical on 4 pads (SH)`: each property with
+/// how many pads carry it and their numbers, bounded like [`listed`]. A BGA
+/// has hundreds, and the complete list is in `dropped_pad_properties`.
+fn summarized_pad_properties(pads: &[super::pad_fabrication::PadWithProperty]) -> String {
+    let mut by_property: Vec<(&str, usize, Vec<String>)> = Vec::new();
+    for pad in pads {
+        let index = by_property
+            .iter()
+            .position(|(property, _, _)| *property == pad.fabrication_property)
+            .unwrap_or_else(|| {
+                by_property.push((&pad.fabrication_property, 0, Vec::new()));
+                by_property.len() - 1
+            });
+        let (_, count, numbers) = &mut by_property[index];
+        *count += 1;
+        // Shield pads share a number; an unnumbered pad has none to show.
+        if !pad.pad.is_empty() && !numbers.contains(&pad.pad) {
+            numbers.push(pad.pad.clone());
+        }
+    }
+    by_property
+        .into_iter()
+        .map(|(property, count, numbers)| {
+            let pads = if count == 1 { "pad" } else { "pads" };
+            if numbers.is_empty() {
+                format!("{property} on {count} unnumbered {pads}")
+            } else {
+                format!("{property} on {count} {pads} ({})", listed(&numbers))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Turn a plan into a conflict the way `plan_sync` does for its own
@@ -4459,12 +4597,16 @@ mod tests {
         "Package_DFN_QFN:Texas_RJE0020A_VQFN-20-1EP_3x3mm_P0.45mm_EP0.675x0.76mm";
     const GENERIC_VQFN: &str = "Package_DFN_QFN:VQFN-20-1EP_3x3mm_P0.45mm_EP1.55x1.55mm";
     const STOCK_0603: &str = "Capacitor_SMD:C_0603_1608Metric";
+    const STOCK_WQFN: &str = "Package_DFN_QFN:WQFN-28-1EP_4x4mm_P0.4mm_EP2.7x2.7mm";
+    const STOCK_USB_C: &str = "Connector_USB:USB_C_Receptacle_HCTL_HC-TYPE-C-16P-01A";
 
-    /// A project whose own `fp-lib-table` resolves three stock KiCad 10.0.5
+    /// A project whose own `fp-lib-table` resolves five stock KiCad
     /// footprints: the two with custom-shape pads that #657 met on a real
-    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`)
-    /// and a plain 0603. A project table shadows the global one, so these
-    /// files are the ones read whether or not KiCad is installed.
+    /// board (provenance in `tests/fixtures/custom_pads_kicad10.README.md`),
+    /// a plain 0603, and the two whose pads carry a fabrication property that
+    /// #193 met (`tests/fixtures/pad_property_kicad10.README.md`). A project
+    /// table shadows the global one, so these files are the ones read whether
+    /// or not KiCad is installed.
     fn project_with_stock_footprints() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("carrier.kicad_pcb");
@@ -4473,7 +4615,7 @@ mod tests {
             include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
         )
         .unwrap();
-        let stock: [(&str, &[u8]); 3] = [
+        let stock: [(&str, &[u8]); 5] = [
             (
                 TEXAS_VQFN,
                 include_bytes!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
@@ -4486,6 +4628,14 @@ mod tests {
                 STOCK_0603,
                 include_bytes!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
             ),
+            (
+                STOCK_WQFN,
+                include_bytes!("../../tests/fixtures/pad_property_wqfn28_kicad10.kicad_mod"),
+            ),
+            (
+                STOCK_USB_C,
+                include_bytes!("../../tests/fixtures/pad_property_usb_c_hctl_kicad10.kicad_mod"),
+            ),
         ];
         for (footprint_id, source) in stock {
             let (library, name) = footprint_id.split_once(':').unwrap();
@@ -4495,7 +4645,7 @@ mod tests {
         }
         std::fs::write(
             temp.path().join("fp-lib-table"),
-            "(fp_lib_table\n  (lib (name \"Package_DFN_QFN\") (type \"KiCad\") (uri \"${KIPRJMOD}/Package_DFN_QFN.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\"))\n)\n",
+            "(fp_lib_table\n  (lib (name \"Package_DFN_QFN\") (type \"KiCad\") (uri \"${KIPRJMOD}/Package_DFN_QFN.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\"))\n  (lib (name \"Connector_USB\") (type \"KiCad\") (uri \"${KIPRJMOD}/Connector_USB.pretty\") (options \"\") (descr \"\"))\n)\n",
         )
         .unwrap();
         (temp, board)
@@ -4531,6 +4681,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             staging: None,
+            dropped_pad_properties: Vec::new(),
         }
     }
 
@@ -5582,6 +5733,202 @@ mod tests {
             refusal.1.contains("3D model clause 'origin'"),
             "{}",
             refusal.1
+        );
+    }
+
+    // ─── #193: say which pad fabrication properties an addition loses ────────
+
+    /// The dropped-property entry and its diagnostic for the stock WQFN, whose
+    /// exposed pad 29 is `pad_prop_heatsink` in the library.
+    fn wqfn_drop(references: &[&str], applied: bool) -> (serde_json::Value, serde_json::Value) {
+        let (placed, sent) = if applied {
+            ("was placed", "they were not sent and cannot be read back")
+        } else {
+            ("will be placed", "they cannot be sent or read back")
+        };
+        (
+            serde_json::json!({
+                "footprint_id": STOCK_WQFN,
+                "references": references,
+                "pads": [{ "pad": "29", "fabrication_property": "heatsink" }]
+            }),
+            serde_json::json!({
+                "code": "pad_fabrication_property_dropped",
+                "message": format!(
+                    "{STOCK_WQFN} (used by {}) {placed} without its pads' fabrication \
+                     properties: heatsink on 1 pad (29). KiCad 10's IPC API has no field \
+                     for a pad's fabrication property, so {sent}. Nothing else about the \
+                     footprint is affected and the sync is not refused, but KiCad's DRC \
+                     reports lib_footprint_mismatch for these parts and fabrication \
+                     outputs treat the pads as ordinary ones until KiCad's Tools → Update \
+                     Footprints from Library restores them.",
+                    references.join(", ")
+                ),
+                "reference": if references.len() == 1 {
+                    serde_json::json!(references[0])
+                } else {
+                    serde_json::Value::Null
+                },
+                "references": references,
+                "footprint_id": STOCK_WQFN
+            }),
+        )
+    }
+
+    /// #193 through the served boundary, with the two stock footprints of the
+    /// report. The dry run used to say `ready` with no diagnostics, the apply
+    /// `applied` with none, and the board had no `pad_prop_*` on it. KiCad
+    /// 10's API cannot carry the property, so it still does not; the plan now
+    /// names every footprint, part and pad that loses one, and stays `ready`.
+    #[tokio::test]
+    async fn a_dry_run_names_the_pad_properties_the_additions_lose() {
+        let served = ServedSync::new().await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[
+                ("U1", STOCK_WQFN, &["1", "29"]),
+                ("C1", STOCK_0603, &["1", "2"]),
+                ("J1", STOCK_USB_C, &["A1", "SH"]),
+                ("U2", STOCK_WQFN, &["1", "29"]),
+            ]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_added"]["planned"], 4);
+        assert_eq!(
+            plan["coverage"]["conflicts"]["planned"], 0,
+            "a dropped property is a warning, not a conflict: {plan:#}"
+        );
+        let (wqfn, wqfn_diagnostic) = wqfn_drop(&["U1", "U2"], false);
+        let shield = serde_json::json!({ "pad": "SH", "fabrication_property": "mechanical" });
+        assert_eq!(
+            plan["dropped_pad_properties"],
+            serde_json::json!([
+                {
+                    "footprint_id": STOCK_USB_C,
+                    "references": ["J1"],
+                    "pads": [shield, shield, shield, shield]
+                },
+                wqfn
+            ]),
+            "{plan:#}"
+        );
+        let diagnostics = plan["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2, "{plan:#}");
+        assert_eq!(diagnostics[0]["code"], "pad_fabrication_property_dropped");
+        assert_eq!(diagnostics[0]["footprint_id"], STOCK_USB_C);
+        assert_eq!(diagnostics[0]["reference"], "J1");
+        assert!(
+            diagnostics[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("fabrication properties: mechanical on 4 pads (SH). "),
+            "{plan:#}"
+        );
+        assert_eq!(diagnostics[1], wqfn_diagnostic, "{plan:#}");
+    }
+
+    /// The apply says the same about what it placed, in the past tense, and
+    /// what `CreateItems` received shows why it has to: the exposed pad is
+    /// sent as an ordinary SMD pad, because the message has nowhere to say
+    /// otherwise.
+    #[tokio::test]
+    async fn an_apply_names_the_pad_properties_the_board_did_not_get() {
+        use konnect_ipc::gen::kiapi;
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let applied = served
+            .apply(&exported_netlist(&[("U1", STOCK_WQFN, &["1", "29"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_added"]["applied"], 1);
+        let (wqfn, wqfn_diagnostic) = wqfn_drop(&["U1"], true);
+        assert_eq!(
+            applied["dropped_pad_properties"],
+            serde_json::json!([wqfn]),
+            "{applied:#}"
+        );
+        assert_eq!(
+            applied["diagnostics"],
+            serde_json::json!([wqfn_diagnostic]),
+            "{applied:#}"
+        );
+
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        let exposed = sent[0]
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .map(|child| kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap())
+            .find(|pad| pad.number == "29")
+            .expect("the exposed pad is still placed");
+        assert_eq!(exposed.r#type(), kiapi::board::types::PadType::PtSmd);
+    }
+
+    /// A footprint with no pad property is reported as losing none: the list
+    /// is present and empty, and no diagnostic is raised.
+    #[tokio::test]
+    async fn a_footprint_without_pad_properties_reports_none_dropped() {
+        let served = ServedSync::new().await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["dropped_pad_properties"], serde_json::json!([]));
+        assert_eq!(plan["diagnostics"], serde_json::json!([]));
+    }
+
+    /// A plan that is refused adds nothing, so it drops nothing: the warning
+    /// would otherwise sit beside the conflict as if the part had been placed.
+    #[tokio::test]
+    async fn a_refused_plan_reports_no_dropped_pad_properties() {
+        let served = ServedSync::new().await;
+
+        let refused = served
+            .dry_run(&exported_netlist(&[
+                ("U1", STOCK_WQFN, &["1", "29"]),
+                ("U3", GENERIC_VQFN, &["1", "2"]),
+            ]))
+            .await;
+
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["dropped_pad_properties"], serde_json::json!([]));
+        let codes = refused["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(codes, ["unsupported_library_footprint"], "{refused:#}");
+    }
+
+    /// A BGA's balls all carry `pad_prop_bga`; the message stays bounded and
+    /// counts them, and an unnumbered pad is counted without a number.
+    #[test]
+    fn the_pad_property_summary_is_bounded_and_grouped() {
+        use crate::tools::pad_fabrication::PadWithProperty;
+
+        let pad = |number: &str, property: &str| PadWithProperty {
+            pad: number.to_string(),
+            fabrication_property: property.to_string(),
+        };
+        let mut pads = (1..=20)
+            .map(|ball| pad(&format!("A{ball}"), "bga"))
+            .collect::<Vec<_>>();
+        pads.push(pad("", "heatsink"));
+        pads.push(pad("FID", "fiducial_loc"));
+
+        assert_eq!(
+            summarized_pad_properties(&pads),
+            "bga on 20 pads (A1, A2, A3, A4, A5, A6, A7, A8 and 12 more); \
+             heatsink on 1 unnumbered pad; fiducial_loc on 1 pad (FID)"
         );
     }
 }
