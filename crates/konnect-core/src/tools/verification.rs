@@ -48,18 +48,23 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
-             project file. Refuses while KiCad holds the board open, because KiCad's next save \
-             rewrites the project file from its own copy. Each value must lie in the range \
-             KiCad loads (the schema's minimum and maximum): KiCad replaces a value outside it \
-             with its default when it opens the project, so such a value is refused and \
-             nothing is written.",
+            "Set board-wide DRC minima (clearance, trace width, via size and drill, hole to \
+             hole, copper to board edge, silkscreen text height and thickness) in the sibling \
+             KiCAD project file. Omitted values are kept, and a call that changes nothing does \
+             not rewrite the file. Refuses while KiCad holds the board open, because KiCad's \
+             next save rewrites the project file from its own copy. Each value must lie in the \
+             range KiCad loads (the schema's minimum and maximum): KiCad replaces a value \
+             outside it with its default when it opens the project, so such a value is refused \
+             and nothing is written. Returns the rules as re-read from the saved file.",
             set_design_rules_schema(),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
         ),
         tool!(
             "get_design_rules",
-            "Return the current design rule constraints defined in the sibling KiCAD project file.",
+            "Return the board-wide DRC minima stored in the sibling KiCAD project file: \
+             clearance, trace width, via size and drill, hole to hole, copper to board edge, \
+             and silkscreen text height and thickness, in mm. A rule the file does not hold is \
+             null.",
             json!({
                 "type": "object",
                 "properties": {
@@ -376,7 +381,8 @@ struct DesignRule {
 /// key in `pcbnew/board_design_settings.cpp`; its `Load` keeps a value that
 /// lies between them, bounds included, and takes the default otherwise. #196
 /// measured that on KiCad 10.0.6 for the first five keys: -0.01, 25.01 and
-/// (for `min_hole_to_hole`) 10.01 each loaded as the default.
+/// (for `min_hole_to_hole`) 10.01 each loaded as the default. The ranges of
+/// the last three (#194) are read from that source and were not measured.
 fn design_rules() -> &'static [DesignRule] {
     &[
         DesignRule {
@@ -408,6 +414,27 @@ fn design_rules() -> &'static [DesignRule] {
             project_key: "min_hole_to_hole",
             range_mm: (0.0, 10.0),
             description: "Minimum hole-to-hole clearance in mm",
+        },
+        // KiCad also loads -0.01 here, as a flag for the pre-6.0 method that
+        // takes the clearance from the Edge.Cuts line width. That is not a
+        // clearance a caller sets, so the range starts at 0.
+        DesignRule {
+            argument: "min_copper_edge_clearance",
+            project_key: "min_copper_edge_clearance",
+            range_mm: (0.0, 25.0),
+            description: "Minimum copper to board edge clearance in mm",
+        },
+        DesignRule {
+            argument: "min_text_height",
+            project_key: "min_text_height",
+            range_mm: (0.0, 100.0),
+            description: "Minimum silkscreen text height in mm",
+        },
+        DesignRule {
+            argument: "min_text_thickness",
+            project_key: "min_text_thickness",
+            range_mm: (0.0, 25.0),
+            description: "Minimum silkscreen text stroke thickness in mm",
         },
     ]
 }
@@ -570,6 +597,12 @@ async fn handle_set_design_rules(
 
     let project_rules = project_rules_mut(&mut project)?;
     for (rule, value) in requested {
+        // A value the file already holds is not a change. Naming only those
+        // leaves the file alone: a rewrite would re-serialise the whole
+        // document for nothing.
+        if project_rules.get(rule.project_key).and_then(Value::as_f64) == Some(value) {
+            continue;
+        }
         project_rules.insert(rule.project_key.to_string(), json!(value));
         changed.push(format!("{} = {}", rule.project_key, value));
     }
@@ -589,11 +622,18 @@ async fn handle_set_design_rules(
         }
     }
 
+    // What the file holds now, read again rather than echoed from the request.
+    let saved: Value = serde_json::from_str(&read_consistent(&project_path)?)?;
+
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "project": project_path,
-            "changed": changed
+            "changed": changed,
+            "rules": design_rules_readback(&saved),
+            "note": "Board-wide DRC minima in the project file. They set no track, via or text \
+                     size and do not prove a fab will accept the board. KiCad reads them when it \
+                     next opens the project."
         }))
         .unwrap(),
     ))

@@ -128,6 +128,10 @@ fn assert_invalid_argument(body: &Value, field: &str) {
 /// #196: every value KiCad would reset on load is refused by name, and the
 /// project file is left byte for byte. The values are the ones the issue
 /// measured on KiCad 10.0.6, just outside each end of the range.
+///
+/// One case here is Konnect's line rather than KiCad's: KiCad loads -0.01 for
+/// `min_copper_edge_clearance` as its pre-6.0 flag, and the tool refuses it
+/// because it is not a clearance.
 #[tokio::test]
 async fn a_value_kicad_would_reset_on_load_is_refused_and_nothing_is_written() {
     let handler = handler().await;
@@ -156,9 +160,9 @@ async fn a_value_kicad_would_reset_on_load_is_refused_and_nothing_is_written() {
     }
 }
 
-/// The ranges are not all alike: 10.01 mm loads for the four 25 mm rules and
-/// is reset for `min_hole_to_hole`, as #196's table shows. A shared bound
-/// would get one of the two wrong.
+/// The ranges are not all alike: 10.01 mm loads for every other rule and is
+/// reset for `min_hole_to_hole`, as #196's table shows. A shared bound would
+/// get one of the two wrong.
 #[tokio::test]
 async fn hole_to_hole_has_its_own_narrower_range() {
     let handler = handler().await;
@@ -300,4 +304,212 @@ fn the_schema_advertises_each_rule_range() {
     assert_eq!(range("min_via_drill"), (0.0, 25.0));
     assert_eq!(range("min_via_size"), (0.0, 25.0));
     assert_eq!(range("min_hole_to_hole"), (0.0, 10.0));
+    // #194's three, as KiCad 10.0 registers them. Text height alone goes to
+    // 100 mm.
+    assert_eq!(range("min_copper_edge_clearance"), (0.0, 25.0));
+    assert_eq!(range("min_text_height"), (0.0, 100.0));
+    assert_eq!(range("min_text_thickness"), (0.0, 25.0));
+}
+
+// ─── #194: copper-to-edge clearance and the silkscreen text minima ───────────
+
+/// The three minima #194 adds, as argument and project key (they are the
+/// same word), with the value the KiCad-saved fixture holds.
+const FAB_MINIMA: &[(&str, f64)] = &[
+    ("min_copper_edge_clearance", 0.5),
+    ("min_text_height", 0.8),
+    ("min_text_thickness", 0.08),
+];
+
+/// `get_design_rules` reports what KiCad saved for the three, beside the five
+/// it already reported.
+#[tokio::test]
+async fn get_design_rules_reports_the_edge_clearance_and_text_minima_kicad_saved() {
+    let handler = handler().await;
+    let project = project();
+
+    let body = call(&handler, "get_design_rules", &project.board, json!({})).await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(
+        body["rules"],
+        json!({
+            "min_clearance": 0.0,
+            "min_trace_width": 0.2,
+            "min_via_drill": 0.3,
+            "min_via_size": 0.5,
+            "min_hole_to_hole": 0.25,
+            "min_copper_edge_clearance": 0.5,
+            "min_text_height": 0.8,
+            "min_text_thickness": 0.08
+        })
+    );
+}
+
+/// Setting a fab's three values (JLCPCB's, from the issue) changes exactly
+/// those keys. Everything else KiCad wrote, in `rules` and outside it, and the
+/// board file are as they were; the response is what the file now holds.
+#[tokio::test]
+async fn setting_the_three_minima_changes_only_those_keys() {
+    let handler = handler().await;
+    let project = project();
+    let before = project.json();
+    let board_before = std::fs::read(&project.board).unwrap();
+
+    let body = call(
+        &handler,
+        "set_design_rules",
+        &project.board,
+        json!({
+            "min_copper_edge_clearance": 0.2,
+            "min_text_height": 1.0,
+            "min_text_thickness": 0.15
+        }),
+    )
+    .await;
+
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(body["changed"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(body["rules"]["min_copper_edge_clearance"], json!(0.2));
+    assert_eq!(body["rules"]["min_text_height"], json!(1.0));
+    assert_eq!(body["rules"]["min_text_thickness"], json!(0.15));
+    // Adjacent constraints, read back from the same file.
+    assert_eq!(body["rules"]["min_trace_width"], json!(0.2));
+    assert_eq!(body["rules"]["min_hole_to_hole"], json!(0.25));
+
+    // The file differs from KiCad's save in those three values and nowhere
+    // else: put them back and the documents are equal.
+    let mut after = project.json();
+    let rules = &mut after["board"]["design_settings"]["rules"];
+    assert_eq!(rules["min_copper_edge_clearance"], json!(0.2));
+    assert_eq!(rules["min_text_height"], json!(1.0));
+    assert_eq!(rules["min_text_thickness"], json!(0.15));
+    for (key, saved) in FAB_MINIMA {
+        rules[*key] = json!(saved);
+    }
+    assert_eq!(after, before);
+    assert_eq!(std::fs::read(&project.board).unwrap(), board_before);
+
+    // And `get_design_rules` agrees with the write's own readback.
+    let read = call(&handler, "get_design_rules", &project.board, json!({})).await;
+    assert_eq!(read["rules"], body["rules"]);
+}
+
+/// Each of the three on its own: the other two keep KiCad's value.
+#[tokio::test]
+async fn naming_one_minimum_leaves_the_other_two_as_saved() {
+    let handler = handler().await;
+    for (named, _) in FAB_MINIMA {
+        let project = project();
+        let body = call(
+            &handler,
+            "set_design_rules",
+            &project.board,
+            json!({ *named: 0.3 }),
+        )
+        .await;
+        assert_eq!(body["isError"], false, "{named}: {body}");
+        assert_eq!(body["changed"], json!([format!("{named} = 0.3")]));
+
+        let rules = project.rules();
+        for (key, saved) in FAB_MINIMA {
+            let expected = if key == named { 0.3 } else { *saved };
+            assert_eq!(rules[*key], json!(expected), "{named} set, reading {key}");
+        }
+    }
+}
+
+/// A call naming only values the file already holds, or no value at all,
+/// reports no change and leaves KiCad's bytes alone. A rewrite would
+/// re-serialise the document in Konnect's formatting for nothing.
+#[tokio::test]
+async fn a_call_that_changes_nothing_does_not_rewrite_the_project_file() {
+    let handler = handler().await;
+    for arguments in [
+        json!({}),
+        json!({
+            "min_copper_edge_clearance": 0.5,
+            "min_text_height": 0.8,
+            "min_text_thickness": 0.08,
+            "min_trace_width": 0.2
+        }),
+    ] {
+        let project = project();
+        let before = project.text();
+        let modified = std::fs::metadata(&project.project_file)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let body = call(&handler, "set_design_rules", &project.board, arguments).await;
+
+        assert_eq!(body["isError"], false, "{body}");
+        assert_eq!(body["changed"], json!([]));
+        assert_eq!(body["rules"]["min_text_height"], json!(0.8));
+        assert_eq!(project.text(), before);
+        assert_eq!(
+            std::fs::metadata(&project.project_file)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "the project file was replaced by a no-op"
+        );
+    }
+}
+
+/// A project file with no `rules` yet: the named minimum is created, and
+/// what is still absent reads as null rather than a number KiCad never
+/// stored.
+#[tokio::test]
+async fn a_minimum_is_created_in_a_project_that_has_no_rules_yet() {
+    let handler = handler().await;
+    let project = project();
+    let mut bare = project.json();
+    bare["board"]["design_settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rules");
+    std::fs::write(
+        &project.project_file,
+        serde_json::to_string_pretty(&bare).unwrap(),
+    )
+    .unwrap();
+
+    let read = call(&handler, "get_design_rules", &project.board, json!({})).await;
+    assert_eq!(read["rules"]["min_text_height"], Value::Null, "{read}");
+
+    let body = call(
+        &handler,
+        "set_design_rules",
+        &project.board,
+        json!({ "min_text_height": 1.0 }),
+    )
+    .await;
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(body["rules"]["min_text_height"], json!(1.0));
+    assert_eq!(body["rules"]["min_text_thickness"], Value::Null);
+    assert_eq!(project.rules(), json!({ "min_text_height": 1.0 }));
+}
+
+/// A value of the wrong type is refused by the served dispatch, naming the
+/// field, before the file is touched.
+#[tokio::test]
+async fn a_minimum_of_the_wrong_type_is_refused_by_name() {
+    let handler = handler().await;
+    for (argument, _) in FAB_MINIMA {
+        for bad in [json!("1.0"), json!(true), json!([1.0])] {
+            let project = project();
+            let before = project.text();
+            let body = call(
+                &handler,
+                "set_design_rules",
+                &project.board,
+                json!({ *argument: bad }),
+            )
+            .await;
+            assert_invalid_argument(&body, argument);
+            assert_eq!(project.text(), before, "{argument} = {bad}");
+        }
+    }
 }
