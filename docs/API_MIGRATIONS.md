@@ -3,6 +3,156 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `set_design_rules` refuses values KiCad would reset (patch release)
+
+`min_clearance`, `min_trace_width`, `min_via_drill` and `min_via_size` must be
+0 to 25 mm, and `min_hole_to_hole` 0 to 10 mm (bounds included). KiCad replaces
+a value outside that range with its default when it opens the project, so the
+call used to report success while DRC ran with a different limit. Such a value,
+or one that is not a number, is now refused as `invalid_argument` naming the
+field, and nothing is written; a call naming several values writes none of them
+if one is refused. The schema advertises each range as `minimum`/`maximum`. A
+non-number value was previously skipped silently (#196).
+
+## Unreleased: `set_design_rules` / `get_design_rules` cover copper-to-edge clearance and silkscreen text minima (minor release)
+
+New optional arguments `min_copper_edge_clearance` (0 to 25 mm),
+`min_text_height` (0 to 100 mm) and `min_text_thickness` (0 to 25 mm);
+`get_design_rules.rules` reports the same three keys, `null` where the project
+file holds none. `set_design_rules` no longer rewrites the project file when
+every named value is already stored: `changed` is then empty, where it used to
+list every named value. Its response gains `rules`, re-read from the saved
+file, and `note`. KiCad's legacy `-0.01` flag for `min_copper_edge_clearance`
+cannot be set through this tool (#194).
+
+## Unreleased: new tools `get_drc_severities` and `set_drc_severities`; `run_drc` reports `ignored_checks` (minor release)
+
+`get_drc_severities` returns every check in the project file's
+`board.design_settings.rule_severities` with its severity, the ignored ones as
+`ignored_checks`, `source: "project_file"`, and `board_open_in_kicad` (`true`,
+`false`, or `null` when unknown); when the board is open the file can be older
+than Board Setup in KiCad. `set_drc_severities` merges a map of check key to
+`error` / `warning` / `ignore`: it refuses an unknown key or value as
+`invalid_argument`, refuses while KiCad holds the board open, returns
+`conflict` if the project file changed between read and write, and does not
+rewrite the file for a no-op. `run_drc`'s summary gains `ignored_checks`, the
+rule keys KiCad's report lists as switched off, or `null` when the report has
+no such list. The report written by `output` and returned by
+`get_drc_violations` carries the same list as
+`ignored_checks: [{key, description}]`. Additive; the `verification` toolset
+goes from 10 to 12 tools (#203).
+
+## Unreleased: `run_drc` counts violations per rule and can list selected rules (minor release)
+
+The summary gains `by_rule`: `{ "<rule>": { "errors": n, "warnings": n } }`,
+counted over every violation at or above `severity` and not limited by `limit`.
+New optional argument `rules`, an array of rule keys: only violations of those
+rules are listed, `shown` and `truncated` describe that listing, and
+`rules_filter` echoes the list (`null` when omitted). `filtered_count`,
+`errors`, `warnings` and `by_rule` are not narrowed by `rules`. An empty or
+malformed `rules` is refused as `invalid_argument`. Additive (#188).
+
+## Unreleased: `edit_board_text` and `edit_footprint_field` set the remaining text attributes (minor release)
+
+Both tools now accept `mirrored`, `horizontal_alignment`
+(`left`/`center`/`right`), `vertical_alignment` (`top`/`center`/`bottom`),
+`bold`, `italic`, `keep_upright`, `knockout`, `locked` and `font` (a face name;
+the empty string selects KiCad's stroke font). They follow the existing
+contract: a property that is not named is sent back as KiCad holds it, the edit
+is one undo step, and the result is a fresh readback. A KiCad that accepts the
+update but does not hold a requested value returns
+`mutation_outcome_uncertain` naming the property. No argument was removed and
+the response shape is unchanged (#202).
+
+## Unreleased: `mirror: "auto"` on `edit_board_text` and `edit_footprint_field` (minor release)
+
+A layer change still leaves the mirror flag alone by default. Pass
+`mirror: "auto"` to set `mirrored` from the side of the layer the text ends on:
+true on a back layer (`B.*`), false on a front layer (`F.*`), unchanged on a
+layer with no side. That layer is `layer` when the call names one and the
+text's current layer otherwise. Position and angle are not changed. The
+response then carries a `mirror` object with the layer and side the decision
+was made from. `mirror: "auto"` together with `mirrored` returns
+`invalid_argument` on `mirror`. `mirror: "keep"` is the default (#202).
+
+## Unreleased: new tool `set_footprint_field_style` (minor release)
+
+`set_footprint_field_style` sets `size_x`, `size_y` and/or `thickness` on the
+reference and/or value field (`fields`, default `["reference"]`) of the
+footprints named in `references`, or of every footprint when it is omitted. It
+repairs fields below a minimum text thickness, which
+`update_footprints_from_library` keeps as placed. With KiCad holding the board
+the edit is live and one undo step; otherwise the saved file is edited, only
+while it still holds the content that was read (`conflict` otherwise). `source`
+says which path ran. The response lists each field's values before and after
+from a fresh readback. A named reference that is missing or ambiguous refuses
+the whole call; a whole-board run lists fields it could not edit in `skipped`.
+No existing tool changed. The `pcb_board` toolset now has 18 tools (#198).
+
+## Unreleased: `update_pcb_from_schematic` names the pad fabrication properties it cannot carry (minor release)
+
+KiCad 10's IPC API has no field for a pad's fabrication property
+(`pad_prop_heatsink`, `pad_prop_bga`, `pad_prop_mechanical`,
+`pad_prop_castellated`, …), so a footprint the sync adds reaches the board
+without it. The sync used to say nothing; KiCad's DRC then reported
+`lib_footprint_mismatch` for each such part. The dry run and the apply now
+return `dropped_pad_properties`: one entry per library footprint with
+`footprint_id`, `references` and `pads` (`pad`, `fabrication_property`), and
+one `pad_fabrication_property_dropped` diagnostic per footprint. This is a
+warning: the plan stays `ready`, `coverage.conflicts` is unchanged, and nothing
+else about the placed footprint differs. Run KiCad's Tools → Update Footprints
+from Library on the listed parts to restore the properties.
+`dropped_pad_properties` is always present and empty when nothing is lost;
+callers that treated any diagnostic as a conflict should check `status` instead
+(#193).
+
+## Unreleased: pad fabrication property on `edit_footprint_pad` and `create_footprint` (minor release)
+
+`edit_footprint_pad` takes an optional `fabrication_property`: `none`, `bga`,
+`fiducial_glob`, `fiducial_loc`, `testpoint`, `heatsink`, `castellated`,
+`mechanical` or `pressfit`. It writes the pad's `(property pad_prop_…)` clause
+where KiCad writes it, `none` removes it, and omitting the argument leaves the
+pad unchanged. The response reports `fabrication_property` as read off the
+written pad. `create_footprint` accepts the same key on each `pads[]` item and
+returns `pad_fabrication_properties`, the pads that carry one.
+`get_footprint_info` with `include_pads` now reports `fabrication_property` on
+every pad (`none` when it has none). All additions are optional or additive;
+existing calls behave as before. The property is stored in the library
+footprint; a footprint placed on a board through KiCad 10's API does not carry
+it (see `dropped_pad_properties`, #193) (#195).
+
+## Unreleased: `place_component` builds Reference and Value fields from the library's text (patch release)
+
+`place_component` and `update_pcb_from_schematic` now build a new footprint's
+Reference and Value fields from the library footprint's text: layer,
+visibility, font size, thickness, line spacing, face, bold/italic,
+justification and keep-upright. Before, only the position came from the
+library; KiCad saved the fields with `(unlocked yes)`, no thickness and
+`(line_spacing 0)`, and the Value was hidden on the silkscreen. A stock part's
+Value now appears on `F.Fab`, visible, as in the library. Footprints already on
+a board are not changed. `add_mounting_hole`'s inline footprint keeps its
+fields on the silkscreen with the Value hidden, now with KiCad's default
+thickness (0.15 mm), line spacing 1 and keep-upright on. No argument or
+response field changed (#201).
+
+## Unreleased: `update_footprints_from_library` keeps library stroke styles and plans `noop` after an apply (patch release)
+
+`update_footprints_from_library` now keeps each library graphic's line style.
+Before, every refreshed `fp_line`/`fp_rect`/`fp_circle`/`fp_arc`/`fp_poly` was
+sent with no style and KiCad saved it as `(type default)`, whatever the library
+said. `place_component` and `update_pcb_from_schematic` send the library's
+style too. A stroke that names no type is sent as `default`; a stroke type
+KiCad does not write is refused as an unsupported library footprint.
+
+A dry run after an apply now reports `noop`. The planner used to report `pads`,
+`graphics` and `metadata` again on every run, because it compared details KiCad
+adds to every listed item (the parent footprint's id, a zero-size drill on a
+pad with no hole, rounding and chamfer ratios on pads that use neither). The
+plan also no longer treats `default` and `solid` strokes as the same: a board
+refreshed by an earlier version, whose strokes were saved as `(type default)`,
+plans a `graphics` change once and the apply restores the library's style. Plan
+revisions from before the upgrade no longer match; rerun the dry run (#200).
+
 ## Unreleased: project-file writers refuse a project file that changed mid-edit (patch release)
 
 `set_design_rules`, `set_predefined_sizes`, `create_netclass` and
