@@ -391,6 +391,28 @@ fn write_board_edits(
     board_write_outcome(board_path, operation, written)
 }
 
+/// The same guard for the board's sibling `.kicad_pro` (#197): replace
+/// `project_path` with `content` only while it still holds `read`, the text
+/// `content` was derived from. The project-file writers re-serialise the
+/// whole document, so writing over a newer file would restore the old image.
+pub(crate) fn write_project_file(
+    project_path: &Path,
+    operation: &str,
+    read: &str,
+    content: String,
+) -> anyhow::Result<Option<CallToolResult>> {
+    #[cfg(test)]
+    board_write_hook::run(project_path);
+    let written = transact_atomic(project_path, move |current| {
+        Ok(if current == read {
+            (content, true)
+        } else {
+            (current.to_owned(), false)
+        })
+    });
+    guarded_write_outcome(project_path, "project file", operation, written)
+}
+
 /// What `write_board_edits` tells the caller. The writer reports a readback
 /// that no longer holds the edit as `SexpError::Conflict`; by then the board
 /// was replaced, so that is an uncertain outcome, not a refusal.
@@ -399,29 +421,47 @@ fn board_write_outcome(
     operation: &str,
     written: Result<bool, SexpError>,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    let path = board_path.display().to_string();
+    guarded_write_outcome(board_path, "board", operation, written)
+}
+
+/// `board_write_outcome` for any guarded file; `what` names it in the message
+/// ("board", "project file").
+fn guarded_write_outcome(
+    file_path: &Path,
+    what: &str,
+    operation: &str,
+    written: Result<bool, SexpError>,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let path = file_path.display().to_string();
     match written {
         Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            ToolErrorKind::Conflict {
-                paths: vec![path.clone()],
-            },
-            format!(
-                "Board '{path}' changed after Konnect read it, so {operation} wrote nothing. \
-                 Reload the board and retry."
-            ),
-        ))),
+        Ok(false) => {
+            let mut subject = what.to_string();
+            if let Some(first) = subject.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            Ok(Some(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![path.clone()],
+                },
+                format!(
+                    "{subject} '{path}' changed after Konnect read it, so {operation} wrote \
+                     nothing. Reload the {what} and retry."
+                ),
+            )))
+        }
         Err(SexpError::Conflict { .. }) => {
-            let reason = "the board no longer held the edit when read back after the write";
+            let reason =
+                format!("the {what} no longer held the edit when read back after the write");
             Ok(Some(CallToolResult::error_kind(
                 ToolErrorKind::MutationOutcomeUncertain {
                     operation: operation.to_string(),
                     path: path.clone(),
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                 },
                 format!(
-                    "{operation} replaced board '{path}', but {reason}. Another program may \
-                     have saved it. Reload and inspect the board before retrying."
+                    "{operation} replaced {what} '{path}', but {reason}. Another program may \
+                     have saved it. Reload and inspect the {what} before retrying."
                 ),
             )))
         }
@@ -430,9 +470,9 @@ fn board_write_outcome(
 }
 
 /// A test-only seam between a fallback's read and its write, where a test
-/// plays the intervening save.
+/// plays the intervening save. The project-file writers share it.
 #[cfg(test)]
-mod board_write_hook {
+pub(crate) mod board_write_hook {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -443,12 +483,12 @@ mod board_write_hook {
     }
 
     /// Run `hook` just before the next board write on this thread.
-    pub(super) fn set(hook: impl FnOnce(&Path) + 'static) {
+    pub(crate) fn set(hook: impl FnOnce(&Path) + 'static) {
         HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// Whether a hook is still waiting for a write.
-    pub(super) fn armed() -> bool {
+    pub(crate) fn armed() -> bool {
         HOOK.with(|slot| slot.borrow().is_some())
     }
 

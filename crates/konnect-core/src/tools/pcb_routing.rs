@@ -12,7 +12,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
+use konnect_sexp::writer::{apply_edits, read_consistent, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -1298,10 +1298,11 @@ fn project_settings_path(board_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Load the project JSON, refusing (rather than inventing a file KiCad never
-/// reads) when it is absent.
+/// reads) when it is absent. The middle value is the exact text read, which
+/// `save_project_settings` must still find in the file.
 fn load_project_settings(
     board_path: &std::path::Path,
-) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value), CallToolResult>> {
+) -> anyhow::Result<Result<(std::path::PathBuf, String, serde_json::Value), CallToolResult>> {
     let pro = project_settings_path(board_path);
     if !pro.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -1311,9 +1312,10 @@ fn load_project_settings(
             pro.display()
         ))));
     }
-    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pro)?)
+    let text = read_consistent(&pro)?;
+    let settings: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", pro.display()))?;
-    Ok(Ok((pro, settings)))
+    Ok(Ok((pro, text, settings)))
 }
 
 /// The netclass writers' guard. Saving the board in KiCad also rewrites the
@@ -1329,17 +1331,24 @@ async fn refuse_while_kicad_holds_the_board(
     crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, board_path, "netclass change").await
 }
 
+/// Replace the project file with `settings`, but only while it still holds
+/// `read`, the text `settings` was parsed from. The whole document is
+/// re-serialised, so writing over a file that changed since would restore the
+/// old image of everything else in it (#197). `Some` is the refusal to return.
 fn save_project_settings(
     pro: &std::path::Path,
+    operation: &str,
+    read: &str,
     settings: &serde_json::Value,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<CallToolResult>> {
     // KiCad's own writer emits 2-space-indented JSON with alphabetical keys;
     // serde_json's pretty printer matches both, so the diff stays minimal.
-    write_atomic(
+    crate::tools::pcb_board::write_project_file(
         pro,
-        &format!("{}\n", serde_json::to_string_pretty(settings)?),
-    )?;
-    Ok(())
+        operation,
+        read,
+        format!("{}\n", serde_json::to_string_pretty(settings)?),
+    )
 }
 
 /// The class every other class inherits from. `SetName` marks it on an exact
@@ -1401,7 +1410,7 @@ async fn handle_create_netclass(
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, read, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1488,7 +1497,9 @@ async fn handle_create_netclass(
     // whole project file — the serialiser re-emits the document rather than
     // patching it — for a call that decided nothing.
     if changed {
-        save_project_settings(&pro, &settings)?;
+        if let Some(conflict) = save_project_settings(&pro, "create_netclass", &read, &settings)? {
+            return Ok(conflict);
+        }
     }
 
     let note = if backfilled.is_empty() {
@@ -1592,7 +1603,7 @@ async fn handle_get_netclasses(
         Ok(source) => source,
         Err(refusal) => return Ok(refusal),
     };
-    let (pro, settings) = match load_project_settings(&board_path)? {
+    let (pro, _, settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1828,7 +1839,7 @@ async fn handle_assign_net_to_class(
         return Ok(refusal);
     }
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    let (pro, read, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1889,7 +1900,9 @@ async fn handle_assign_net_to_class(
     } else {
         patterns.push(json!({ "netclass": netclass, "pattern": net_name }));
     }
-    save_project_settings(&pro, &settings)?;
+    if let Some(conflict) = save_project_settings(&pro, "assign_net_to_class", &read, &settings)? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "assigned": true,
@@ -2626,6 +2639,81 @@ mod netclass_tests {
         assert_eq!(hv["track_width"], json!(0.25), "{hv}");
         assert_eq!(hv["via_drill"], json!(0.4), "{hv}");
         assert_eq!(hv["via_diameter"], json!(0.8), "{hv}");
+    }
+
+    /// #197: both netclass writers re-serialise the whole project file. A
+    /// save landing between their read and their write must be refused as
+    /// `conflict` and kept byte for byte, not replaced by the older image.
+    /// The retry, which reads the newer file, then writes and keeps it.
+    #[tokio::test]
+    async fn a_project_file_saved_between_read_and_write_is_refused_and_kept() {
+        use crate::tools::pcb_board::board_write_hook;
+
+        /// An edit by `tool` that changes the project file.
+        async fn edit(tool: &str, board: &std::path::Path) -> CallToolResult {
+            match tool {
+                "create_netclass" => create(board, json!({ "name": "HV", "clearance": 0.9 })).await,
+                _ => assign(board, "HV_IN", "HV").await,
+            }
+        }
+
+        for tool in ["create_netclass", "assign_net_to_class"] {
+            let (_dir, board) = fixture(true);
+            let pro = board.with_extension("kicad_pro");
+            create(&board, json!({ "name": "HV" })).await;
+
+            // The save in between: a design rule another writer set.
+            let mut newer = project_json(&board);
+            newer["board"]["design_settings"]["rules"] = json!({ "min_clearance": 0.3 });
+            let newer = serde_json::to_string_pretty(&newer).unwrap();
+            let saved = newer.clone();
+            board_write_hook::set(move |path| std::fs::write(path, saved).unwrap());
+            let refused = edit(tool, &board).await;
+
+            assert!(
+                !board_write_hook::armed(),
+                "{tool} bypassed the revision-checked write"
+            );
+            assert!(
+                refused.is_error,
+                "{tool} reported success over a newer file"
+            );
+            let body: serde_json::Value = serde_json::from_str(&text_of(&refused)).unwrap();
+            assert_eq!(body["error"]["kind"], "conflict", "{tool}: {body}");
+            assert_eq!(
+                body["error"]["paths"],
+                json!([pro.display().to_string()]),
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pro).unwrap(),
+                newer,
+                "{tool} must leave the newer save byte for byte"
+            );
+
+            // Nothing in between this time: the write goes through, on top of
+            // the newer file.
+            let retried = edit(tool, &board).await;
+            assert!(!retried.is_error, "{tool}: {}", text_of(&retried));
+            let after = project_json(&board);
+            assert_eq!(
+                after["board"]["design_settings"]["rules"]["min_clearance"],
+                json!(0.3),
+                "{tool}: {after}"
+            );
+            match tool {
+                "create_netclass" => assert_eq!(
+                    after["net_settings"]["classes"][0]["clearance"],
+                    json!(0.9),
+                    "{after}"
+                ),
+                _ => assert_eq!(
+                    after["net_settings"]["netclass_patterns"],
+                    json!([{ "netclass": "HV", "pattern": "HV_IN" }]),
+                    "{after}"
+                ),
+            }
+        }
     }
 
     /// Membership is a netclass_patterns entry keyed by the exact net name.
