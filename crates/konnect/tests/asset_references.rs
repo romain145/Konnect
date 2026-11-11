@@ -745,6 +745,16 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_found",
         "unavailable",
         "ambiguous",
+        // Pad fabrication property values (#195), not callable tools.
+        "fiducial_glob",
+        "fiducial_loc",
+        // Sync response field and diagnostic code for the properties KiCad
+        // 10's API cannot carry (#193), not callable tools.
+        "dropped_pad_properties",
+        "pad_fabrication_property_dropped",
+        // KiCad DRC rule keys named in the pad guidance, not callable tools.
+        "copper_edge_clearance",
+        "lib_footprint_mismatch",
     ];
 
     let mut phantom = Vec::new();
