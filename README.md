@@ -5,44 +5,60 @@
 <img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
 
 
-# Konnect has moved to Konnect-EDA
-
-## [Go to Konnect-EDA →](https://github.com/Orchis-ai-LLC/Konnect-EDA)
+# Konnect (open-source fork)
 
 </div>
 
-This repository is being archived, which makes it read-only. Development continues
-at Konnect-EDA, from Orchis.ai LLC.
+## About this fork
 
-## It stays free, unless you're a business
+This repository is a fork of [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect).
+It keeps the open-source Konnect code maintained under the
+**[GNU AGPL-3.0](LICENSE)**.
 
-Konnect-EDA is now commercial and closed source. Here's what that means for you:
+**Why it exists.** The original repository is being archived, which makes it
+read-only. Its authors continue development as
+[Konnect-EDA](https://github.com/Orchis-ai-LLC/Konnect-EDA), a commercial,
+closed-source product from Orchis.ai LLC. The AGPL code they published stays
+available, and this fork carries it forward with fixes and new tools.
 
-- **Everyone, businesses included:** free until version 1.0.
-- **Personal, hobby, student and open-hardware work:** still free after 1.0. You'll
-  need a license key, and that key is free too.
-- **Businesses:** a paid license from 1.0.
+**What it is not.** This fork is independent. It is not affiliated with, endorsed
+by, or supported by Orchis.ai LLC or the original maintainers, and it does not
+track Konnect-EDA. If you want the vendor-supported product, use Konnect-EDA.
 
-Business licenses pay for the work, and that's what lets us keep it free for
-everyone else.
+**What stays the same.** The plugin keeps the identifier
+`com.github.mixelpixx.konnect`, so a release from this fork installs over an
+existing Konnect 0.13.0 in KiCAD's Plugin and Content Manager, and your MCP
+client configuration keeps working.
 
-**Nothing here is being taken away.** The code and releases in this repository stay
-available under the AGPL-3.0. The original
-[KiCAD MCP Server](https://github.com/mixelpixx/KiCAD-MCP-Server) stays open source
-under the MIT license and is still maintained. The boards you design are always yours.
+| | |
+|---|---|
+| Downloads | [Releases of this fork](https://github.com/romain145/Konnect/releases) |
+| Bugs and requests | [Issues of this fork](https://github.com/romain145/Konnect/issues) |
+| Upstream history | [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect), up to v0.13.0 |
+| Vendor product | [Konnect-EDA](https://github.com/Orchis-ai-LLC/Konnect-EDA) |
 
-## Where to go now
+### What this fork has added
 
-- **Downloads:** the [Konnect-EDA releases page](https://github.com/Orchis-ai-LLC/Konnect-EDA/releases).
-  The first release is coming soon.
-- **Bugs and feature requests:** the
-  [Konnect-EDA issue tracker](https://github.com/Orchis-ai-LLC/Konnect-EDA/issues).
-- **Want to help build it?** [Sign up to contribute](https://orchis.ai/konnect/join).
-- **Contributed to Konnect?** Please [complete your sign-off](https://orchis.ai/konnect/sign-off)
-  by November 20.
-- **Using it at a company?** See [licensing](https://konnect-eda.orchis.ai/licensing/).
+**0.13.1**
 
-Thank you to everyone who built Konnect with us.
+- **Silkscreen text tools** in the `pcb_board` toolset: `list_footprint_fields`,
+  `edit_footprint_field`, `list_board_texts` and `edit_board_text` read and edit
+  reference designators, value fields and board text in place on the live
+  board. Before, the only way to change board text was to delete and recreate
+  it, which lost the font.
+- **Edits work with the schematic editor open.** KiCAD 10.0.7 and later refuse a
+  commit that names no document when more than one editor is open. Konnect now
+  names the board in every commit.
+- **Five more bundled skills:** `kicad-silkscreen`, `kicad-hierarchy`,
+  `kicad-autoroute`, `kicad-navigation` and `kicad-templates`, for the toolsets
+  that had no workflow guidance.
+
+Known limit: `edit_footprint_field` rewrites the whole footprint through
+KiCAD's API. On KiCAD 10.0 this drops the footprint's symbol-unit mapping and
+can rewrite a rule area defined inside the footprint. Run **Update PCB from
+Schematic** after using it. `edit_board_text` is not affected.
+
+Thank you to everyone who built Konnect.
 
 ---
 
@@ -50,7 +66,7 @@ Thank you to everyone who built Konnect with us.
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**228 tools across 21 on-demand toolsets.** Schematic capture, PCB layout and
+**232 tools across 21 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -91,7 +107,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 228 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 232 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -140,7 +156,7 @@ Konnect.
 
 ### From the KiCAD Plugin Manager (recommended)
 
-1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
+1. Download the package for your OS from [Releases](https://github.com/romain145/Konnect/releases):
    `konnect-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
    bundles that platform's server binary — the macOS package is a universal
    build, so one download covers Apple Silicon and Intel. (The `konnect-pcm-*`
@@ -349,8 +365,9 @@ no strings attached.** Design boards, ship them, sell them.
 
 If you're a business: the AGPL requires that anything you build on or around Konnect —
 including software provided over a network — be open-sourced under the same license.
-If that doesn't work for you, **commercial licenses are available**: see
-[COMMERCIAL.md](COMMERCIAL.md).
+This fork is AGPL-3.0 only and cannot grant any other license.
+[COMMERCIAL.md](COMMERCIAL.md) describes the commercial terms of the original
+authors; ask them, not this fork, about a commercial license.
 
 ## Relationship to KiCAD-MCP-Server
 
@@ -365,7 +382,7 @@ the architecture it proved, rebuilt for production:
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
 | Context cost | Router pattern | Load/unload toolsets + observability |
-| Skills / agents | — | 6 skills + 2 agents bundled |
+| Skills / agents | — | 11 skills + 2 agents bundled |
 | License | MIT | AGPL-3.0 + commercial |
 
 ## Troubleshooting
@@ -392,9 +409,9 @@ works only when passed with `--config`.)
 
 ## Support
 
-- Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
-  for installation help, AI-client setup, design-workflow discussion,
-  contributor coordination, and live project-status updates
-- Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
+- Issues & feature requests for this fork:
+  [GitHub Issues](https://github.com/romain145/Konnect/issues)
+- The Konnect community Discord belongs to the original project and does not
+  support this fork
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
