@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **234 registered tools** + **7 always-visible meta-tools** = **241 total**
+- **235 registered tools** + **7 always-visible meta-tools** = **242 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 17 tools
+### `pcb_board` · 18 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import; inspect and edit placed board text and footprint reference/value fields in place.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs), [`crates/konnect-core/src/tools/pcb_text.rs`](crates/konnect-core/src/tools/pcb_text.rs)
 
@@ -253,6 +253,7 @@ and Windows servers do not.
 | `edit_board_text` | Move, rotate, resize, re-layer, re-word or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) one board-level text item in place by UUID, preserving every property not named (font face, non-square size, raw variable text). `mirror: "auto"` sets `mirrored` from the side of the layer the text ends on. Refuses when the live text has lost a text variable the saved board holds. One undo step; fresh readback, and a property KiCad did not take is an error. Live only. |
 | `list_footprint_fields` | List the reference, value and other fields of one or every placed footprint with board-absolute position, absolute angle, glyph size, thickness, layer, visibility, alignment, and KiCad's bounding box. Live only. |
 | `edit_footprint_field` | Move, rotate, resize, hide/show, re-layer or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) a placed footprint's reference or value field in place, preserving every property not named. `mirror: "auto"` sets `mirrored` from the side of the layer the field ends on. One undo step; fresh readback, and a mismatch is an error. Live only. |
+| `set_footprint_field_style` | Set the glyph size and/or stroke thickness of the reference or value field on the named footprints, or on every footprint: the repair for fields below a minimum text thickness. Live in one undo step when KiCad holds the board, otherwise a revision-checked edit of the saved file (`source` says which). Lists each field's values before and after from a fresh readback. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 

@@ -283,47 +283,65 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    Ok(
-        match live_board::observe(ctx, board_path, move |client, _| f(client)).await? {
-            LiveBoard::Answered(value) => BoardWrite::Ipc(value),
-            LiveBoard::Recovered(message) => {
-                BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
-            }
-            LiveBoard::Uncertain(message) => {
-                BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
-            }
-            // An endpoint that served no board is mapped exactly as a
-            // rejection, which is what it was before those cases had names —
-            // `observed_live` and `absence` deliberately unread here. Whether
-            // a write should instead treat a proven-absent editor as
-            // permission is #577's question, not this one's.
-            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
-                BoardWrite::Refused(CallToolResult::error(format!(
-                    "KiCAD rejected the {what} over IPC: {message}. \
+    attempt_ipc_write_in(ctx, board_path, what, move |client, _| f(client)).await
+}
+
+/// [`attempt_ipc_write`] for a write that addresses the board through the
+/// document KiCad resolved for `board_path`, as the `*_in` client methods do.
+pub(crate) async fn attempt_ipc_write_in<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    what: &str,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+{
+    Ok(match live_board::observe(ctx, board_path, f).await? {
+        LiveBoard::Answered(value) => BoardWrite::Ipc(value),
+        LiveBoard::Recovered(message) => {
+            BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
+        }
+        LiveBoard::Uncertain(message) => {
+            BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
+        }
+        // An endpoint that served no board is mapped exactly as a
+        // rejection, which is what it was before those cases had names —
+        // `observed_live` and `absence` deliberately unread here. Whether
+        // a write should instead treat a proven-absent editor as
+        // permission is #577's question, not this one's.
+        LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+            BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
                  The board file was not modified — KiCAD is reachable and may hold this \
                  board open, so editing the file directly could be silently overwritten."
-                )))
-            }
-            LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
-            LiveBoard::Unresolved(error) => {
-                BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
-            }
-            // A lock outranks the never-reached verdict: it is persistent evidence
-            // that an editor may hold newer state even where no IPC session ever did.
-            LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
-                Some(refusal) => BoardWrite::Refused(refusal),
-                None => BoardWrite::File(NoLiveBoard::Unreachable),
-            },
-            // A lock outranks this verdict too, but only when the transport is
-            // what went away: it is then the more specific evidence, and
-            // `reason` is machine-readable, so which one a client sees must not
-            // depend on how the arms were folded.
-            LiveBoard::LostAfterObservation {
-                situation,
-                ipc_unreachable,
-            } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+            )))
+        }
+        LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+        LiveBoard::Unresolved(error) => {
+            BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
+        }
+        // A lock outranks the never-reached verdict: it is persistent evidence
+        // that an editor may hold newer state even where no IPC session ever did.
+        LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
+            Some(refusal) => BoardWrite::Refused(refusal),
+            None => BoardWrite::File(NoLiveBoard::Unreachable),
         },
-    )
+        // A lock outranks this verdict too, but only when the transport is
+        // what went away: it is then the more specific evidence, and
+        // `reason` is machine-readable, so which one a client sees must not
+        // depend on how the arms were folded.
+        LiveBoard::LostAfterObservation {
+            situation,
+            ipc_unreachable,
+        } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+    })
 }
 
 /// A board observed live and now out of reach. When the transport is what
@@ -371,7 +389,7 @@ fn unsafe_file_fallback(
 /// refused as `conflict` instead of being overwritten with an edit of the
 /// older read. `write_atomic_if_unchanged` would report that refusal and a
 /// failed post-write readback as the same `Conflict`; these need telling apart.
-fn write_board_edits(
+pub(crate) fn write_board_edits(
     board_path: &Path,
     operation: &str,
     content: String,
