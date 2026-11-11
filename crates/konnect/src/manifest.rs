@@ -104,6 +104,31 @@ pub const SKILLS: &[SkillManifest] = &[
         content: include_str!("../assets/skills/kicad-library/SKILL.md"),
         references: &[],
     },
+    SkillManifest {
+        name: "kicad-silkscreen",
+        content: include_str!("../assets/skills/kicad-silkscreen/SKILL.md"),
+        references: &[],
+    },
+    SkillManifest {
+        name: "kicad-hierarchy",
+        content: include_str!("../assets/skills/kicad-hierarchy/SKILL.md"),
+        references: &[],
+    },
+    SkillManifest {
+        name: "kicad-autoroute",
+        content: include_str!("../assets/skills/kicad-autoroute/SKILL.md"),
+        references: &[],
+    },
+    SkillManifest {
+        name: "kicad-navigation",
+        content: include_str!("../assets/skills/kicad-navigation/SKILL.md"),
+        references: &[],
+    },
+    SkillManifest {
+        name: "kicad-templates",
+        content: include_str!("../assets/skills/kicad-templates/SKILL.md"),
+        references: &[],
+    },
 ];
 
 // ─── Agents ──────────────────────────────────────────────────────────────────

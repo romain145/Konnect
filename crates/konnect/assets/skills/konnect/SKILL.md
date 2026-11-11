@@ -104,6 +104,23 @@ unload_toolset("name")  → Remove a toolset when done
 | Templates | templates |
 | Manufacturing | manufacturing |
 
+## Workflow Skills
+
+Use the skill that matches the task; each names the toolsets it needs.
+
+| Task | Skill |
+|------|-------|
+| Schematic capture and wiring | kicad-schematic |
+| Hierarchical sheets, sheet pins, buses | kicad-hierarchy |
+| Reference-circuit templates | kicad-templates |
+| PCB layout and manual routing | kicad-pcb |
+| Autorouting with Freerouting | kicad-autoroute |
+| Silkscreen clean-up, reference designators, board text | kicad-silkscreen |
+| Reading the editor selection, cross-probing | kicad-navigation |
+| Symbols, footprints, libraries | kicad-library |
+| ERC, DRC, design review | kicad-review |
+| Fabrication outputs | kicad-manufacture |
+
 ## Agent Routing and Mutation Ownership
 
 Use one design owner at a time. Delegation creates isolated context, so give an
