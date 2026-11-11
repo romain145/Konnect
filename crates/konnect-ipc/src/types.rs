@@ -357,6 +357,53 @@ pub struct IpcPadDefinition {
     pub roundrect_ratio: f64,
 }
 
+/// A graphic's line style, as `(stroke (type …))` names it in a footprint.
+///
+/// Carried with every library graphic because the alternative is the protobuf
+/// default, `SLS_UNKNOWN`, which KiCad stores as `default`: a refresh then
+/// rewrote each `(type solid)` stroke of a stock footprint as `(type default)`
+/// (#200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcStrokeStyle {
+    /// `default`. Also given to a stroke that names no type.
+    #[default]
+    Default,
+    Solid,
+    Dash,
+    Dot,
+    DashDot,
+    DashDotDot,
+}
+
+impl IpcStrokeStyle {
+    /// The style a `(type …)` token names, or `None` for a token KiCad does
+    /// not write.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "default" => Self::Default,
+            "solid" => Self::Solid,
+            "dash" => Self::Dash,
+            "dot" => Self::Dot,
+            "dash_dot" => Self::DashDot,
+            "dash_dot_dot" => Self::DashDotDot,
+            _ => return None,
+        })
+    }
+
+    /// The wire value. Never `SLS_UNKNOWN`.
+    pub fn to_proto(self) -> crate::gen::kiapi::common::types::StrokeLineStyle {
+        use crate::gen::kiapi::common::types::StrokeLineStyle;
+        match self {
+            Self::Default => StrokeLineStyle::SlsDefault,
+            Self::Solid => StrokeLineStyle::SlsSolid,
+            Self::Dash => StrokeLineStyle::SlsDash,
+            Self::Dot => StrokeLineStyle::SlsDot,
+            Self::DashDot => StrokeLineStyle::SlsDashdot,
+            Self::DashDotDot => StrokeLineStyle::SlsDashdotdot,
+        }
+    }
+}
+
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from
 /// the library `.kicad_mod` source.
 ///
@@ -372,6 +419,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
     },
     /// `fp_rect` — axis-aligned rectangle between two opposite corners.
     Rect {
@@ -379,6 +427,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// `fp_circle` — center plus a point on the circumference.
@@ -387,6 +436,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// `fp_arc` — start / mid / end points.
@@ -396,12 +446,14 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
     },
     /// `fp_poly` — closed outline.
     Poly {
         points: Vec<(f64, f64)>,
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// Visible `fp_text` / `property` text.

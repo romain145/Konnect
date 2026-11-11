@@ -3218,12 +3218,14 @@ mod tests {
                     end: (2.0, -2.5),
                     layer: silk(),
                     width: 0.12,
+                    style: Default::default(),
                 },
                 konnect_ipc::IpcGraphicDefinition::Rect {
                     start: (-2.6, -3.0),
                     end: (2.6, 3.0),
                     layer: "F.CrtYd".to_string(),
                     width: 0.05,
+                    style: Default::default(),
                     filled: false,
                 },
                 konnect_ipc::IpcGraphicDefinition::Circle {
@@ -3231,6 +3233,7 @@ mod tests {
                     end: (-1.6, -1.8),
                     layer: silk(),
                     width: 0.12,
+                    style: Default::default(),
                     filled: true,
                 },
                 konnect_ipc::IpcGraphicDefinition::Arc {
@@ -3239,11 +3242,13 @@ mod tests {
                     end: (1.0, -2.5),
                     layer: "F.Fab".to_string(),
                     width: 0.1,
+                    style: Default::default(),
                 },
                 konnect_ipc::IpcGraphicDefinition::Poly {
                     points: vec![(-1.0, 2.0), (1.0, 2.0), (0.0, 2.8)],
                     layer: "F.Fab".to_string(),
                     width: 0.1,
+                    style: Default::default(),
                     filled: true,
                 },
                 konnect_ipc::IpcGraphicDefinition::Text {

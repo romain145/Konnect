@@ -777,6 +777,7 @@ fn place_footprint_sends_graphics_children() {
             end: (0.8, 0.7),
             layer: "F.CrtYd".to_string(),
             width: 0.05,
+            style: Default::default(),
             filled: false,
         },
         IpcGraphicDefinition::Line {
@@ -784,6 +785,7 @@ fn place_footprint_sends_graphics_children() {
             end: (0.6, -0.5),
             layer: "F.SilkS".to_string(),
             width: 0.12,
+            style: Default::default(),
         },
         IpcGraphicDefinition::Text {
             text: "R_0402".to_string(),
@@ -1625,6 +1627,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
             layer: "F.SilkS".to_string(),
             width: 0.12,
+            style: Default::default(),
             filled: false,
         }],
         &konnect_ipc::IpcFieldPlacement::default(),

@@ -4759,11 +4759,15 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
         } => {
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
             builders::pack_any(
-                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+                &builders::with_stroke_style(
+                    builders::board_segment(layer, *width, x1, y1, x2, y2),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4772,6 +4776,7 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
             filled,
         } => {
             if is_cardinal_rotation(rotation) {
@@ -4780,14 +4785,17 @@ fn build_graphic_child(
                 let (x1, y1) = xf(*start);
                 let (x2, y2) = xf(*end);
                 builders::pack_any(
-                    &builders::board_rectangle(
-                        layer,
-                        *width,
-                        x1.min(x2),
-                        y1.min(y2),
-                        x1.max(x2),
-                        y1.max(y2),
-                        *filled,
+                    &builders::with_stroke_style(
+                        builders::board_rectangle(
+                            layer,
+                            *width,
+                            x1.min(x2),
+                            y1.min(y2),
+                            x1.max(x2),
+                            y1.max(y2),
+                            *filled,
+                        ),
+                        *style,
                     ),
                     SHAPE,
                 )
@@ -4802,7 +4810,10 @@ fn build_graphic_child(
                     xf((start.0, end.1)),
                 ];
                 builders::pack_any(
-                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                    &builders::with_stroke_style(
+                        builders::board_polygon(layer, *width, *filled, &[corners]),
+                        *style,
+                    ),
                     SHAPE,
                 )
             }
@@ -4812,6 +4823,7 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
             filled,
         } => {
             let (cx, cy) = xf(*center);
@@ -4819,7 +4831,10 @@ fn build_graphic_child(
             // circumference-point encoding by re-deriving it from the length.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                &builders::with_stroke_style(
+                    builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4829,12 +4844,16 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
         } => {
             let (sx, sy) = xf(*start);
             let (mx, my) = xf(*mid);
             let (ex, ey) = xf(*end);
             builders::pack_any(
-                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                &builders::with_stroke_style(
+                    builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4842,11 +4861,15 @@ fn build_graphic_child(
             points,
             layer,
             width,
+            style,
             filled,
         } => {
             let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
             builders::pack_any(
-                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+                &builders::with_stroke_style(
+                    builders::board_polygon(layer, *width, *filled, &[transformed]),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -6225,6 +6248,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 2.0),
                 layer: "F.CrtYd".to_string(),
                 width: 0.05,
+                style: Default::default(),
                 filled: false,
             },
             IpcGraphicDefinition::Line {
@@ -6232,6 +6256,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "F.SilkS".to_string(),
                 width: 0.12,
+                style: Default::default(),
             },
             IpcGraphicDefinition::Text {
                 text: "hello".to_string(),
@@ -6402,6 +6427,81 @@ mod footprint_graphics_tests {
         assert!(format!("{unknown:#}").contains("Reference"), "{unknown:#}");
     }
 
+    /// #200: every shape kind carries the line style it was given, and none
+    /// goes out as `SLS_UNKNOWN`, which KiCad stores as `default` whatever the
+    /// library said. Checked at a rotation that turns the rectangle into a
+    /// polygon too, since that arm builds a different message.
+    #[test]
+    fn each_shape_is_sent_with_its_own_stroke_style() {
+        use crate::types::IpcStrokeStyle;
+        use kiapi::common::types::StrokeLineStyle;
+
+        let layer = || "F.SilkS".to_string();
+        let graphics = |style: IpcStrokeStyle| {
+            vec![
+                IpcGraphicDefinition::Line {
+                    start: (-1.0, 0.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                },
+                IpcGraphicDefinition::Rect {
+                    start: (-1.0, -2.0),
+                    end: (1.0, 2.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+                IpcGraphicDefinition::Circle {
+                    center: (0.0, 0.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+                IpcGraphicDefinition::Arc {
+                    start: (-1.0, 0.0),
+                    mid: (0.0, 1.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                },
+                IpcGraphicDefinition::Poly {
+                    points: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+            ]
+        };
+        for (style, expected) in [
+            (IpcStrokeStyle::Solid, StrokeLineStyle::SlsSolid),
+            (IpcStrokeStyle::Default, StrokeLineStyle::SlsDefault),
+            (IpcStrokeStyle::Dash, StrokeLineStyle::SlsDash),
+        ] {
+            for rotation in [0.0, 37.0] {
+                let sent: Vec<_> = shapes(&build(&graphics(style), 100.0, 50.0, rotation))
+                    .iter()
+                    .map(|shape| {
+                        shape
+                            .shape
+                            .as_ref()
+                            .and_then(|shape| shape.attributes.as_ref())
+                            .and_then(|attributes| attributes.stroke.as_ref())
+                            .expect("a stroke")
+                            .style()
+                    })
+                    .collect();
+                assert_eq!(sent, vec![expected; 5], "{style:?} at {rotation}");
+            }
+        }
+    }
+
     /// At 180° the text would read upside down; KiCAD keeps labels readable by
     /// flipping such angles 180°, and so does the emitted child.
     #[test]
@@ -6441,6 +6541,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "F.CrtYd".to_string(),
             width: 0.05,
+            style: Default::default(),
             filled: false,
         }];
         let fp = build(&graphics, 0.0, 0.0, 45.0);
@@ -6472,6 +6573,7 @@ mod footprint_graphics_tests {
             end: (1.5, 0.0),
             layer: "F.Fab".to_string(),
             width: 0.1,
+            style: Default::default(),
             filled: true,
         }];
         let fp = build(&graphics, 10.0, 10.0, 90.0);
@@ -6557,6 +6659,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "Dwgs.User".to_string(),
                 width: 0.1,
+                style: Default::default(),
             },
             IpcGraphicDefinition::Text {
                 text: "PCB Edge".to_string(),
@@ -6635,6 +6738,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "In99.Cu".to_string(),
             width: 0.1,
+            style: Default::default(),
         }];
         let error = format!(
             "{:#}",

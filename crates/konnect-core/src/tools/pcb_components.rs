@@ -331,6 +331,26 @@ fn graphic_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
         .unwrap_or(0.12)
 }
 
+/// Line style from `(stroke … (type t))`.
+///
+/// Read so the placed graphic keeps it: sent without one, KiCad saved each of
+/// a stock footprint's `(type solid)` strokes as `(type default)` (#200). A
+/// stroke that names no type, and the legacy bare `(width w)` that cannot name
+/// one, are `default`. A type KiCad does not write is refused rather than
+/// drawn as something else.
+fn graphic_stroke_style(
+    node: &konnect_sexp::SexpNode,
+) -> anyhow::Result<konnect_ipc::IpcStrokeStyle> {
+    let Some(token) = node
+        .find("stroke")
+        .and_then(|stroke| stroke.find_str("type"))
+    else {
+        return Ok(konnect_ipc::IpcStrokeStyle::Default);
+    };
+    konnect_ipc::IpcStrokeStyle::from_token(token)
+        .ok_or_else(|| anyhow::anyhow!("footprint graphic has an unknown stroke type '{token}'"))
+}
+
 /// `(fill yes)` (KiCad 8+) or legacy `(fill solid)`.
 fn graphic_filled(node: &konnect_sexp::SexpNode) -> bool {
     matches!(node.find_str("fill"), Some("yes") | Some("solid"))
@@ -525,6 +545,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(line, "end", "fp_line")?,
             layer: graphic_layer(line, "fp_line")?,
             width: graphic_stroke_width(line),
+            style: graphic_stroke_style(line)?,
         });
     }
     for rect in footprint.find_all("fp_rect") {
@@ -533,6 +554,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(rect, "end", "fp_rect")?,
             layer: graphic_layer(rect, "fp_rect")?,
             width: graphic_stroke_width(rect),
+            style: graphic_stroke_style(rect)?,
             filled: graphic_filled(rect),
         });
     }
@@ -542,6 +564,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(circle, "end", "fp_circle")?,
             layer: graphic_layer(circle, "fp_circle")?,
             width: graphic_stroke_width(circle),
+            style: graphic_stroke_style(circle)?,
             filled: graphic_filled(circle),
         });
     }
@@ -552,6 +575,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(arc, "end", "fp_arc")?,
             layer: graphic_layer(arc, "fp_arc")?,
             width: graphic_stroke_width(arc),
+            style: graphic_stroke_style(arc)?,
         });
     }
     for poly in footprint.find_all("fp_poly") {
@@ -576,6 +600,7 @@ fn extract_graphic_definitions_with_properties(
             points,
             layer: graphic_layer(poly, "fp_poly")?,
             width: graphic_stroke_width(poly),
+            style: graphic_stroke_style(poly)?,
             filled: graphic_filled(poly),
         });
     }
@@ -4335,7 +4360,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rect,
-            Graphic::Rect { layer, width, filled, start, end }
+            Graphic::Rect { layer, width, filled, start, end, .. }
                 if layer == "F.CrtYd" && *width == 0.05 && !*filled
                     && *start == (-0.8, -0.7) && *end == (0.8, 0.7)
         ));
@@ -7660,5 +7685,79 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+/// #200: a library graphic's line style reaches the placement path.
+#[cfg(test)]
+mod stroke_style_tests {
+    use super::*;
+    use konnect_ipc::{IpcGraphicDefinition as Graphic, IpcStrokeStyle};
+
+    /// Unmodified `Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod` from
+    /// KiCad 10's standard library. Its two silkscreen lines and its courtyard
+    /// and fabrication rectangles are all `(type solid)`.
+    const C_0603: &str = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+
+    fn style(graphic: &Graphic) -> Option<IpcStrokeStyle> {
+        match graphic {
+            Graphic::Line { style, .. }
+            | Graphic::Rect { style, .. }
+            | Graphic::Circle { style, .. }
+            | Graphic::Arc { style, .. }
+            | Graphic::Poly { style, .. } => Some(*style),
+            Graphic::Text { .. } => None,
+        }
+    }
+
+    #[test]
+    fn the_stock_footprints_solid_strokes_are_read_as_solid() {
+        let styles: Vec<_> = extract_graphic_definitions(C_0603)
+            .unwrap()
+            .iter()
+            .filter_map(style)
+            .collect();
+
+        assert_eq!(styles, vec![IpcStrokeStyle::Solid; 4]);
+    }
+
+    #[test]
+    fn every_stroke_type_kicad_writes_is_read_and_an_absent_one_is_default() {
+        let with_type =
+            |stroke_type: &str| C_0603.replace("(type solid)", &format!("(type {stroke_type})"));
+        for (token, expected) in [
+            ("default", IpcStrokeStyle::Default),
+            ("dash", IpcStrokeStyle::Dash),
+            ("dot", IpcStrokeStyle::Dot),
+            ("dash_dot", IpcStrokeStyle::DashDot),
+            ("dash_dot_dot", IpcStrokeStyle::DashDotDot),
+        ] {
+            let graphics = extract_graphic_definitions(&with_type(token)).unwrap();
+            assert_eq!(
+                graphics.iter().filter_map(style).collect::<Vec<_>>(),
+                vec![expected; 4],
+                "{token}"
+            );
+        }
+
+        let untyped = C_0603.replace("\t\t\t(type solid)\n", "");
+        assert_ne!(untyped, C_0603);
+        assert_eq!(
+            extract_graphic_definitions(&untyped)
+                .unwrap()
+                .iter()
+                .filter_map(style)
+                .collect::<Vec<_>>(),
+            vec![IpcStrokeStyle::Default; 4]
+        );
+    }
+
+    #[test]
+    fn a_stroke_type_kicad_does_not_write_is_refused_not_redrawn() {
+        let error = extract_graphic_definitions(&C_0603.replace("(type solid)", "(type wavy)"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("wavy"), "{error}");
     }
 }

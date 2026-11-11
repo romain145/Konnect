@@ -476,11 +476,33 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
     kiapi::common::types::StrokeAttributes {
         width: Some(distance(width_mm)),
-        // ponytail: leave style/color at proto default (solid, board default color).
-        // Add args when a caller needs dashed/colored graphics.
+        // Style 0 is `SLS_UNKNOWN`, not solid; KiCad stores it as `default`
+        // (#200). That suits a graphic drawn straight onto the board, which
+        // has no style to keep. A graphic copied from a library footprint
+        // states its style with `with_stroke_style`.
         style: 0,
         color: None,
     }
+}
+
+/// `shape` with its stroke drawn in `style`.
+///
+/// For a graphic that has a line style of its own to keep: one read from a
+/// library footprint. Left at the builders' `SLS_UNKNOWN`, KiCad saved every
+/// `(type solid)` stroke of a refreshed footprint as `(type default)` (#200).
+pub fn with_stroke_style(
+    mut shape: kiapi::board::types::BoardGraphicShape,
+    style: crate::types::IpcStrokeStyle,
+) -> kiapi::board::types::BoardGraphicShape {
+    if let Some(stroke) = shape
+        .shape
+        .as_mut()
+        .and_then(|shape| shape.attributes.as_mut())
+        .and_then(|attributes| attributes.stroke.as_mut())
+    {
+        stroke.style = style.to_proto() as i32;
+    }
+    shape
 }
 
 fn attrs(width_mm: f64, filled: bool) -> kiapi::common::types::GraphicAttributes {

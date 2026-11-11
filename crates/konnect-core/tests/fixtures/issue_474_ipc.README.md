@@ -18,3 +18,17 @@ that board with `find_open_board`, request `KotPcbFootprint` or `KotPcbZone`
 through `get_items_in`, and write the returned `Any.value` bytes unchanged.
 Do not substitute `build_footprint_item` or `build_zone`: this fixture exists
 to preserve the distinctions present in KiCad's actual IPC messages.
+
+## `issue_474_r1_library.kicad_mod`
+
+The library footprint `R1` is an unchanged copy of, for the planner test of
+`update_footprints_from_library` (#200): a footprint KiCad reports that still
+matches its library must plan `noop`.
+
+It is not a KiCad library file. `Resistor_SMD:R_0402` is not a stock footprint,
+so no library holds it. It was written by hand from `R1`'s block in
+`specctra_two_resistors.kicad_pcb`, which KiCad 10.0.5 saved: every clause is
+that block's, less the lines that belong to the placed instance (`at`, the
+`uuid`s, each pad's `net`) and with the Reference and Value texts put back to
+the library placeholders. The `version` and `generator` lines are the board
+header's. The oracle in the test is the capture, not this file.
