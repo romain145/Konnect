@@ -5,9 +5,28 @@
 
 use crate::gen::kiapi;
 
-/// Converts millimeters to KiCAD nanometers.
+/// Converts millimeters to KiCAD nanometers, rounding to the nearest
+/// nanometre.
+///
+/// The product has to be rounded before the cast because `as i64` truncates
+/// toward zero and most decimal millimetre values are not exact in binary:
+/// `4.1 * 1e6` is `4099999.9999999995`, which truncation turned into
+/// 4_099_999 nm — a nanometre short in every point, distance, pad, via,
+/// graphic and transform built from it, and a false mismatch on readback
+/// (#92).
+///
+/// - Rounding is symmetric: `-4.1` gives -4_100_000, the mirror of `4.1`.
+/// - An exact half rounds away from zero (`f64::round`): 0.5 nm becomes 1,
+///   -0.5 nm becomes -1. A half is below anything a board can express, so
+///   the rule only has to be predictable and sign-symmetric.
+/// - Zero (either sign) gives 0.
+/// - Non-finite input keeps what the bare cast always did, since `round`
+///   passes it through unchanged: NaN gives 0, and ±infinity (like any
+///   product beyond the `i64` range) saturates to `i64::MAX` / `i64::MIN`.
+///   Callers that must refuse such input validate before calling; this
+///   helper has no error channel.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -701,6 +720,84 @@ pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
 
+    /// `4.1 * 1e6` is `4099999.9999999995` in binary floating point, so a
+    /// truncating cast lost a nanometre on an ordinary decimal coordinate
+    /// (#92). Every value here is one a user would type.
+    #[test]
+    fn mm_to_nm_rounds_decimal_millimetres_to_the_nearest_nanometre() {
+        for (mm, nm) in [
+            (4.1, 4_100_000),
+            (0.3, 300_000),
+            (0.1 + 0.2, 300_000),
+            (1.27, 1_270_000),
+            (2.54, 2_540_000),
+            (54.61, 54_610_000),
+            (146.268, 146_268_000),
+            // 1.5 * 0.15, the default text stroke: 0.22499999999999998 mm.
+            (1.5 * 0.15, 225_000),
+            (1.0, 1_000_000),
+        ] {
+            assert_eq!(mm_to_nm(mm), nm, "{mm} mm");
+        }
+    }
+
+    /// Rounding is symmetric about zero: a mirrored coordinate is the exact
+    /// negation of the original, which truncation toward zero also gave but
+    /// rounding toward +∞ would not.
+    #[test]
+    fn mm_to_nm_rounds_negative_values_symmetrically() {
+        for mm in [4.1, 0.3, 0.1 + 0.2, 1.27, 2.54, 54.61, 0.000_000_5] {
+            assert_eq!(mm_to_nm(-mm), -mm_to_nm(mm), "{mm} mm");
+        }
+        assert_eq!(mm_to_nm(-4.1), -4_100_000);
+        assert_eq!(mm_to_nm(-54.61), -54_610_000);
+    }
+
+    /// An exact half nanometre rounds away from zero, on both sides, and not
+    /// to even. These millimetre values multiply to exactly 0.5, 1.5 and 2.5.
+    #[test]
+    fn mm_to_nm_rounds_exact_halves_away_from_zero() {
+        assert_eq!(mm_to_nm(0.000_000_5), 1);
+        assert_eq!(mm_to_nm(-0.000_000_5), -1);
+        assert_eq!(mm_to_nm(0.000_001_5), 2);
+        assert_eq!(mm_to_nm(-0.000_001_5), -2);
+        assert_eq!(mm_to_nm(0.000_002_5), 3);
+        // Either side of the half goes to its nearer neighbour.
+        assert_eq!(mm_to_nm(0.000_000_4), 0);
+        assert_eq!(mm_to_nm(0.000_000_6), 1);
+        assert_eq!(mm_to_nm(-0.000_000_4), 0);
+    }
+
+    /// Zero and non-finite input keep what the bare cast always produced:
+    /// rounding passes NaN and the infinities through, and `as i64` turns
+    /// them into 0 and the saturated extremes.
+    #[test]
+    fn mm_to_nm_keeps_the_cast_s_answer_for_zero_and_non_finite_input() {
+        assert_eq!(mm_to_nm(0.0), 0);
+        assert_eq!(mm_to_nm(-0.0), 0);
+        assert_eq!(mm_to_nm(f64::NAN), 0);
+        assert_eq!(mm_to_nm(f64::INFINITY), i64::MAX);
+        assert_eq!(mm_to_nm(f64::NEG_INFINITY), i64::MIN);
+        assert_eq!(mm_to_nm(f64::MAX), i64::MAX);
+    }
+
+    /// The helper feeds every builder, so the nanometre has to survive into
+    /// the messages themselves: a point, a distance, and a track built from
+    /// 4.1 mm all carry 4_100_000 nm.
+    #[test]
+    fn builders_carry_the_rounded_nanometre_into_points_and_distances() {
+        let point = vec2(4.1, -4.1);
+        assert_eq!(point.x_nm, 4_100_000);
+        assert_eq!(point.y_nm, -4_100_000);
+        assert_eq!(distance(4.1).value_nm, 4_100_000);
+
+        let track = build_track("GND", 1, "F.Cu", 4.1, 4.1, 0.0, 54.61, 4.1);
+        assert_eq!(track.start.unwrap().x_nm, 4_100_000);
+        assert_eq!(track.end.unwrap().x_nm, 54_610_000);
+        assert_eq!(track.end.unwrap().y_nm, 4_100_000);
+        assert_eq!(track.width.unwrap().value_nm, 4_100_000);
+    }
+
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was
     /// widened for #237; a reverse map that lags it turns real layers into
@@ -1051,7 +1148,8 @@ pub(crate) mod tests {
         assert_eq!(text.position.unwrap().x_nm, 12_000_000);
         let attrs = text.attributes.expect("attrs");
         assert_eq!(attrs.size.unwrap().x_nm, 1_500_000);
-        assert!((attrs.stroke_width.unwrap().value_nm - 225_000).abs() <= 1);
+        // 1.5 * 0.15 is 0.22499999999999998 mm; truncation made it 224_999.
+        assert_eq!(attrs.stroke_width.unwrap().value_nm, 225_000);
         assert_eq!(attrs.angle.unwrap().value_degrees, 90.0);
         assert!(!attrs.mirrored);
 
