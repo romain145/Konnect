@@ -3929,6 +3929,81 @@ fn board_text_style_attributes_are_written_and_proven_by_readback() {
     assert!(sent.text.unwrap().attributes.unwrap().mirrored);
 }
 
+/// Item 3 of #202: one edit moves a text to the back and mirrors it, and the
+/// same option on the way back to the front clears the flag.
+#[test]
+fn mirroring_to_match_the_layer_sets_and_clears_the_flag_with_the_side() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+    let to = |layer: &str| konnect_ipc::IpcTextEdit {
+        layer: Some(layer.to_string()),
+        mirror_to_match_layer: true,
+        ..Default::default()
+    };
+    let applied =
+        |outcome: konnect_ipc::IpcTextEditOutcome<konnect_ipc::IpcBoardTextItem>| match outcome {
+            konnect_ipc::IpcTextEditOutcome::Applied { after, .. } => after,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("B.SilkS"), |_| Ok(()))
+            .expect("to the back"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("B.SilkS", true));
+    // The option changes the flag and the layer, not the placement.
+    assert_eq!((text.x_nm, text.y_nm), (20_000_000, 30_000_000));
+    assert_eq!(text.angle_deg, 90.0);
+    assert_eq!(text.horizontal_alignment, "left");
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("F.SilkS"), |_| Ok(()))
+            .expect("back to the front"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("F.SilkS", false));
+
+    // A footprint field takes the same option.
+    let outcome = client
+        .edit_footprint_field_in(
+            document.clone(),
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &to("B.SilkS"),
+        )
+        .expect("field to the back");
+    let konnect_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(
+        (state(&after).layer.as_str(), state(&after).mirrored),
+        ("B.SilkS", true)
+    );
+
+    // Nothing to do is nothing sent: the field is already mirrored on the back.
+    let sent = board.lock().unwrap().updates.len();
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &konnect_ipc::IpcTextEdit {
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .expect("no-op");
+    assert!(
+        matches!(outcome, konnect_ipc::IpcTextEditOutcome::Unchanged { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(board.lock().unwrap().updates.len(), sent);
+}
+
 #[test]
 fn a_font_face_is_replaced_or_cleared_for_the_stroke_font() {
     let board = text_board();

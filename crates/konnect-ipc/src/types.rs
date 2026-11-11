@@ -914,6 +914,11 @@ pub struct IpcTextEdit {
     /// Draw the glyphs mirrored, as text on a back layer must be to read
     /// correctly from that side.
     pub mirrored: Option<bool>,
+    /// Set `mirrored` from the side of the layer the text ends up on: true on
+    /// a back layer, false on a front layer, untouched on a layer with no
+    /// side. That layer is the one this edit names, or the one KiCad holds
+    /// when it names none. Cannot be combined with `mirrored`.
+    pub mirror_to_match_layer: bool,
     pub horizontal_alignment: Option<IpcHorizontalAlignment>,
     pub vertical_alignment: Option<IpcVerticalAlignment>,
     pub bold: Option<bool>,
@@ -923,6 +928,25 @@ pub struct IpcTextEdit {
     pub locked: Option<bool>,
     /// Font face name; the empty string selects KiCad's stroke font.
     pub font_name: Option<String>,
+}
+
+/// The mirror flag text on the layer named `layer` needs to read correctly
+/// from its own side of the board: set on a back layer (`B.SilkS`), clear on
+/// a front one (`F.Fab`). `None` for a layer with no side (inner copper,
+/// `Edge.Cuts`, the user layers), where neither value is the right one.
+///
+/// This is the end state KiCad's Flip leaves a normally-drawn text in. Flip
+/// itself toggles the flag; setting it from the side instead also repairs a
+/// text that was moved to the back without being mirrored, which a toggle
+/// from the same layer could not.
+pub fn mirrored_for_layer_name(layer: &str) -> Option<bool> {
+    if layer.starts_with("B.") {
+        Some(true)
+    } else if layer.starts_with("F.") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// A horizontal text alignment a caller may request. KiCad's

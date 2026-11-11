@@ -74,7 +74,8 @@ treat each placed text as an obstacle for the next.
 - Both tools also set `mirrored`, `horizontal_alignment`, `vertical_alignment`,
   `bold`, `italic`, `keep_upright`, `knockout`, `locked` and `font`. Text on a
   back layer must be mirrored to read correctly from the back; changing `layer`
-  alone does not mirror it.
+  alone does not mirror it. Pass `mirror: "auto"` to set the flag from the side
+  of the layer the text ends on (with `layer`, or alone for text already moved).
 
 After each edit, compare the returned bounding box centre with the intended
 centre and correct the position once if they differ. Then save, call `run_drc`

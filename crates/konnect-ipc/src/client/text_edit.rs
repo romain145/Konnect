@@ -84,6 +84,10 @@ fn vertical_alignment_name(value: i32) -> String {
     .to_string()
 }
 
+fn mirrored_for_layer_side(layer: i32) -> Option<bool> {
+    mirrored_for_layer_name(layer_enum_to_name(layer))
+}
+
 fn horizontal_alignment_value(alignment: IpcHorizontalAlignment) -> i32 {
     use common::HorizontalAlignment as H;
     (match alignment {
@@ -228,6 +232,17 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
     if let Some(layer) = &edit.layer {
         text.layer = crate::builders::try_layer_from_name(layer)? as i32;
     }
+    anyhow::ensure!(
+        !(edit.mirror_to_match_layer && edit.mirrored.is_some()),
+        "mirroring to match the layer and an explicit mirrored flag are two answers to one \
+         question"
+    );
+    // Resolved after the layer change, against the layer the text ends on.
+    let mirrored = match edit.mirrored {
+        Some(mirrored) => Some(mirrored),
+        None if edit.mirror_to_match_layer => mirrored_for_layer_side(text.layer),
+        None => None,
+    };
     if let Some(knockout) = edit.knockout {
         text.knockout = knockout;
     }
@@ -258,7 +273,7 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
         || edit.size_x_nm.is_some()
         || edit.size_y_nm.is_some()
         || edit.stroke_width_nm.is_some()
-        || edit.mirrored.is_some()
+        || mirrored.is_some()
         || edit.horizontal_alignment.is_some()
         || edit.vertical_alignment.is_some()
         || edit.bold.is_some()
@@ -288,7 +303,7 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
         if let Some(value_nm) = edit.stroke_width_nm {
             attributes.stroke_width = Some(common::Distance { value_nm });
         }
-        if let Some(mirrored) = edit.mirrored {
+        if let Some(mirrored) = mirrored {
             attributes.mirrored = mirrored;
         }
         if let Some(alignment) = edit.horizontal_alignment {
@@ -1148,6 +1163,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, original);
+    }
+
+    fn mirrored_after(start: &board::BoardText, layer: Option<&str>) -> bool {
+        let mut text = start.clone();
+        apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                layer: layer.map(str::to_string),
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        text_state(&text).unwrap().mirrored
+    }
+
+    /// Mirroring to match the layer follows the side the text ends on, not
+    /// the flag it started with (#202).
+    #[test]
+    fn mirroring_to_match_the_layer_follows_the_side_the_text_ends_on() {
+        let front = sample();
+        let mut back_unmirrored = sample();
+        back_unmirrored.layer = board::BoardLayer::BlBSilkS as i32;
+        let mut back_mirrored = back_unmirrored.clone();
+        back_mirrored
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .mirrored = true;
+
+        assert!(mirrored_after(&front, Some("B.SilkS")));
+        assert!(mirrored_after(&front, Some("B.Fab")));
+        assert!(!mirrored_after(&back_mirrored, Some("F.SilkS")));
+        assert!(!mirrored_after(&front, Some("F.Fab")));
+        // With no layer named, the layer KiCad holds decides: this is the
+        // text that was moved to the back before anything could mirror it.
+        assert!(mirrored_after(&back_unmirrored, None));
+        assert!(mirrored_after(&back_mirrored, None));
+        assert!(!mirrored_after(&front, None));
+        // A layer with no side leaves the flag as it was, either way.
+        for sideless in ["Edge.Cuts", "In1.Cu", "Dwgs.User"] {
+            assert!(!mirrored_after(&front, Some(sideless)), "{sideless}");
+            assert!(mirrored_after(&back_mirrored, Some(sideless)), "{sideless}");
+        }
+    }
+
+    #[test]
+    fn mirroring_to_match_the_layer_refuses_an_explicit_flag_as_well() {
+        let mut text = sample();
+        let error = apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                mirrored: Some(false),
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("two answers"), "{error:#}");
     }
 
     #[test]

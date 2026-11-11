@@ -35,17 +35,18 @@ use std::path::Path;
 const MAX_TEXT_SIZE_MM: f64 = 250.0;
 
 const EDITABLE_FIELD_PROPERTIES: &str =
-    "x and y, rotation, size_x, size_y, thickness, visible, layer, mirrored, \
+    "x and y, rotation, size_x, size_y, thickness, visible, layer, mirrored (or mirror 'auto'), \
      horizontal_alignment, vertical_alignment, bold, italic, keep_upright, knockout, locked, font";
 const EDITABLE_TEXT_PROPERTIES: &str =
-    "x and y, rotation, size_x, size_y, thickness, layer, text, mirrored, horizontal_alignment, \
-     vertical_alignment, bold, italic, keep_upright, knockout, locked, font";
+    "x and y, rotation, size_x, size_y, thickness, layer, text, mirrored (or mirror 'auto'), \
+     horizontal_alignment, vertical_alignment, bold, italic, keep_upright, knockout, locked, font";
 
 /// The style properties `edit_board_text` and `edit_footprint_field` share,
 /// added to each tool's own schema properties.
 fn with_style_properties(mut schema: Value) -> Value {
     let style = json!({
         "mirrored":             { "type": "boolean", "description": "Draw the glyphs mirrored. Text on a back layer (B.SilkS, B.Fab, B.Cu) must be mirrored to read correctly from the back of the board" },
+        "mirror":               { "type": "string", "enum": ["keep", "auto"], "default": "keep", "description": "'auto' sets 'mirrored' from the side of the layer the text ends on: true on a back layer (B.*), false on a front layer (F.*), unchanged on a layer with no side. That layer is 'layer' when given, otherwise the text's current layer. Position and angle are not changed. Cannot be combined with 'mirrored'" },
         "horizontal_alignment": { "type": "string", "enum": ["left", "center", "right"], "description": "Which side of the text its position anchors" },
         "vertical_alignment":   { "type": "string", "enum": ["top", "center", "bottom"] },
         "bold":                 { "type": "boolean", "description": "Sets the bold flag only; the stroke is changed with 'thickness'" },
@@ -96,8 +97,9 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              reference or value field in place. Name at least one property; every property not \
              named is sent back exactly as KiCad holds it. x/y are board-absolute mm (both or \
              neither); rotation is the field's absolute angle in degrees, the same frame \
-             list_footprint_fields reports. Changing the layer does not mirror the text; pass \
-             'mirrored' with it for a back layer. One KiCad undo step; the result is a fresh \
+             list_footprint_fields reports. Changing the layer alone does not mirror the text: \
+             pass mirror 'auto' with it to mirror on a back layer and unmirror on a front one, \
+             or set 'mirrored' yourself. One KiCad undo step; the result is a fresh \
              readback of what the board holds, and a readback that does not match the request \
              (for example a KiCad that ignores one of the properties) is reported as an error \
              rather than success. Does not save. Requires KiCAD running with the board open.",
@@ -146,8 +148,9 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              italic, keep_upright, knockout, locked, font) one board-level text item in place, \
              selected by UUID (from list_board_texts). Name at least one property; everything \
              not named — font face, non-square size, alignment, the raw text with any \
-             ${VARIABLE} — is sent back exactly as KiCad holds it. Changing the layer does not \
-             mirror the text; pass 'mirrored' with it for a back layer. When 'text' is omitted \
+             ${VARIABLE} — is sent back exactly as KiCad holds it. Changing the layer alone \
+             does not mirror the text: pass mirror 'auto' with it to mirror on a back layer and \
+             unmirror on a front one, or set 'mirrored' yourself. When 'text' is omitted \
              the live text is checked against the saved board, and the edit is refused if a text \
              variable the saved file holds is missing from it; pass 'text' with the exact raw \
              string to write it verbatim. One KiCad undo step; the result is a fresh readback, \
@@ -335,6 +338,18 @@ fn parse_text_edit(
         }
         Some(font) => Some(font.to_string()),
     };
+    let mirrored = opt_bool(args, "mirrored")?;
+    let mirror_to_match_layer = match opt_string(args, "mirror")? {
+        None | Some("keep") => false,
+        Some("auto") if mirrored.is_some() => {
+            return Err(invalid_arg(
+                "mirror",
+                "'auto' cannot be combined with 'mirrored': one of them decides the flag",
+            ))
+        }
+        Some("auto") => true,
+        Some(_) => return Err(invalid_arg("mirror", "must be 'keep' or 'auto'")),
+    };
     let edit = IpcTextEdit {
         position_nm,
         angle_deg,
@@ -344,7 +359,8 @@ fn parse_text_edit(
         layer,
         text,
         visible,
-        mirrored: opt_bool(args, "mirrored")?,
+        mirrored,
+        mirror_to_match_layer,
         horizontal_alignment,
         vertical_alignment,
         bold: opt_bool(args, "bold")?,
@@ -626,6 +642,34 @@ fn live_error_result(error: anyhow::Error, operation: &str) -> CallToolResult {
     }
 }
 
+/// What `mirror: "auto"` decided, read from the state the edit settled on
+/// rather than from the request. A layer with no side is said out loud:
+/// otherwise an `unchanged` result would not tell the caller why.
+fn mirror_auto_report<T>(
+    outcome: &IpcTextEditOutcome<T>,
+    state: fn(&T) -> Option<&IpcTextState>,
+) -> Option<Value> {
+    let settled = match outcome {
+        IpcTextEditOutcome::Unchanged { current } => state(current),
+        IpcTextEditOutcome::Applied { after, .. } => state(after),
+        // An uncertain outcome is an error with its own evidence.
+        IpcTextEditOutcome::Uncertain { .. } => None,
+    }?;
+    Some(match konnect_ipc::mirrored_for_layer_name(&settled.layer) {
+        Some(mirrored) => json!({
+            "mode": "auto",
+            "layer": settled.layer,
+            "side": if mirrored { "back" } else { "front" },
+        }),
+        None => json!({
+            "mode": "auto",
+            "layer": settled.layer,
+            "side": "none",
+            "note": "this layer has no front or back side, so 'mirrored' was left as it is",
+        }),
+    })
+}
+
 /// Turn an edit outcome into the tool result. `render` draws one item.
 fn edit_outcome_result<T>(
     outcome: IpcTextEditOutcome<T>,
@@ -852,6 +896,7 @@ async fn handle_edit_footprint_field(
         Err(result) => return Ok(result),
     };
 
+    let mirror_auto = edit.mirror_to_match_layer;
     let live_reference = reference.clone();
     let outcome = match on_live_board(ctx, &board, move |client, document| {
         client.edit_footprint_field_in(document, &live_reference, slot, &edit)
@@ -865,6 +910,11 @@ async fn handle_edit_footprint_field(
     let mut extra = Map::new();
     extra.insert("reference".into(), json!(reference));
     extra.insert("field".into(), json!(slot.as_str()));
+    if mirror_auto {
+        if let Some(report) = mirror_auto_report(&outcome, |field| field.state.as_ref()) {
+            extra.insert("mirror".into(), report);
+        }
+    }
     Ok(edit_outcome_result(
         outcome,
         "edit_footprint_field",
@@ -926,6 +976,7 @@ async fn handle_edit_board_text(args: &Value, ctx: &ToolContext) -> anyhow::Resu
         Err(result) => return Ok(result),
     };
 
+    let mirror_auto = edit.mirror_to_match_layer;
     let live_uuid = uuid.clone();
     let saved_board = board.clone();
     let outcome = match on_live_board(ctx, &board, move |client, document| {
@@ -965,6 +1016,11 @@ async fn handle_edit_board_text(args: &Value, ctx: &ToolContext) -> anyhow::Resu
     let mut extra = Map::new();
     extra.insert("uuid".into(), json!(uuid));
     extra.insert("text_check".into(), json!(text_check));
+    if mirror_auto {
+        if let Some(report) = mirror_auto_report(&outcome, |text| text.state.as_ref()) {
+            extra.insert("mirror".into(), report);
+        }
+    }
     Ok(edit_outcome_result(
         outcome,
         "edit_board_text",
@@ -1699,6 +1755,103 @@ mod tests {
                 "{tool}: {body}"
             );
         }
+    }
+
+    /// Item 3 of #202 through `tools/call`: a layer change with
+    /// `mirror: "auto"` mirrors on the way to the back and unmirrors on the
+    /// way to the front, for board text and for a footprint field.
+    #[tokio::test]
+    async fn the_served_mirror_auto_follows_the_side_of_the_target_layer() {
+        let scene = LiveScene::new(false).await;
+
+        // The title is on B.SilkS unmirrored. No layer named: the layer it
+        // is on decides, which is the repair the issue was filed for.
+        let (is_error, body) = scene
+            .call(
+                "edit_board_text",
+                json!({ "uuid": "title", "mirror": "auto" }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["changed"], json!(["mirrored"]));
+        assert_eq!(body["after"]["mirrored"], true);
+        assert_eq!(
+            body["mirror"],
+            json!({ "mode": "auto", "layer": "B.SilkS", "side": "back" })
+        );
+
+        let (is_error, body) = scene
+            .call(
+                "edit_board_text",
+                json!({ "uuid": "title", "layer": "F.SilkS", "mirror": "auto" }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["after"]["layer"], "F.SilkS");
+        assert_eq!(body["after"]["mirrored"], false);
+        assert_eq!(body["mirror"]["side"], "front");
+        // Only the layer and the flag moved.
+        assert_eq!(body["after"]["x_mm"], body["before"]["x_mm"]);
+        assert_eq!(body["after"]["angle_deg"], body["before"]["angle_deg"]);
+
+        let (is_error, body) = scene
+            .call(
+                "edit_footprint_field",
+                json!({ "reference": "R1", "layer": "B.SilkS", "mirror": "auto" }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["after"]["layer"], "B.SilkS");
+        assert_eq!(body["after"]["mirrored"], true);
+        assert_eq!(body["mirror"]["side"], "back");
+
+        // A layer with no side keeps the flag and says so.
+        let (is_error, body) = scene
+            .call(
+                "edit_footprint_field",
+                json!({ "reference": "R1", "layer": "Dwgs.User", "mirror": "auto" }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["changed"], json!(["layer"]));
+        assert_eq!(body["after"]["mirrored"], true);
+        assert_eq!(body["mirror"]["side"], "none");
+        assert!(body["mirror"]["note"].is_string(), "{body}");
+
+        // Without the option a layer change still leaves the flag alone, and
+        // the response carries no mirror report.
+        let (is_error, body) = scene
+            .call(
+                "edit_board_text",
+                json!({ "uuid": "title", "layer": "B.Fab" }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["after"]["mirrored"], false);
+        assert!(body.get("mirror").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn mirror_auto_is_refused_with_an_explicit_flag_or_an_unknown_mode() {
+        let scene = LiveScene::new(false).await;
+        for arguments in [
+            json!({ "uuid": "title", "mirror": "auto", "mirrored": true }),
+            json!({ "uuid": "title", "mirror": "flip" }),
+        ] {
+            let (is_error, body) = scene.call("edit_board_text", arguments.clone()).await;
+            assert!(is_error, "{arguments}: {body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "mirror", "{body}");
+        }
+        assert_eq!(scene.held.lock().unwrap().updates, 0);
+
+        // 'keep' is the default spelled out: it names no property by itself.
+        let refused = parse_text_edit(&json!({ "mirror": "keep" }), false, true).unwrap_err();
+        assert_eq!(invalid_field(&refused), "edit");
+        let edit =
+            parse_text_edit(&json!({ "mirror": "keep", "mirrored": true }), true, false).unwrap();
+        assert!(!edit.mirror_to_match_layer);
+        assert_eq!(edit.mirrored, Some(true));
     }
 
     #[tokio::test]
