@@ -2586,15 +2586,24 @@ async fn handle_add_mounting_hole(
 /// does not validate an item's layer, and answered `BL_UNDEFINED` in footprint
 /// graphics with a crash (#237); it also refuses to load a board whose items
 /// name an undefined layer.
+///
+/// The IPC layer map also takes KiCad's display names (`F.Silkscreen`,
+/// `User.Drawings`) and loose inner copper numbers (`In01.Cu`), which a board
+/// file may not carry: KiCad 10.0.6 refuses to load an item on one (#126). So
+/// the name is resolved here to the one the file path writes.
 fn board_layer_arg(
     args: &serde_json::Value,
     default: Option<&str>,
-) -> Result<String, CallToolResult> {
+) -> Result<BoardLayerArg, CallToolResult> {
     let layer = match default {
         Some(default) if args["layer"].is_null() => default,
         _ => require_str(args, "layer")?,
     };
-    if builders::try_layer_from_name(layer).is_err() {
+    let file_name = builders::try_layer_from_name(layer)
+        .ok()
+        .and_then(builders::layer_name)
+        .filter(|name| konnect_sexp::layers::is_canonical_name(name));
+    let Some(file_name) = file_name else {
         return Err(invalid_arg(
             "layer",
             &format!(
@@ -2602,8 +2611,22 @@ fn board_layer_arg(
                  In1.Cu..In30.Cu, F.SilkS, B.SilkS, Edge.Cuts or User.1..User.45"
             ),
         ));
-    }
-    Ok(layer.to_string())
+    };
+    Ok(BoardLayerArg {
+        name: layer.to_string(),
+        file_name,
+    })
+}
+
+/// A `layer` argument [`board_layer_arg`] accepted.
+#[derive(Debug)]
+struct BoardLayerArg {
+    /// As the caller gave it: what the IPC path sends through the layer map
+    /// and what the response echoes.
+    name: String,
+    /// The name KiCad writes in a board file for the same layer (`F.SilkS`
+    /// for `F.Silkscreen`): what the file path writes.
+    file_name: &'static str,
 }
 
 #[cfg(test)]
@@ -2623,9 +2646,40 @@ mod board_layer_arg_tests {
             );
         }
         for absent in [json!({}), json!({ "layer": null })] {
-            assert_eq!(
-                board_layer_arg(&absent, Some("F.SilkS")).unwrap(),
-                "F.SilkS"
+            let layer = board_layer_arg(&absent, Some("F.SilkS")).unwrap();
+            assert_eq!(layer.name, "F.SilkS");
+            assert_eq!(layer.file_name, "F.SilkS");
+        }
+    }
+
+    // #126: the file path writes `file_name`, so it must be a name KiCad
+    // loads whatever spelling the IPC layer map accepted.
+    #[test]
+    fn an_accepted_alias_resolves_to_the_name_a_board_file_carries() {
+        for (given, file_name) in [
+            ("F.Silkscreen", "F.SilkS"),
+            ("B.Silkscreen", "B.SilkS"),
+            ("F.Courtyard", "F.CrtYd"),
+            ("B.Courtyard", "B.CrtYd"),
+            ("F.Adhesive", "F.Adhes"),
+            ("B.Adhesive", "B.Adhes"),
+            ("User.Drawings", "Dwgs.User"),
+            ("User.Comments", "Cmts.User"),
+            ("User.Eco1", "Eco1.User"),
+            ("User.Eco2", "Eco2.User"),
+            ("In01.Cu", "In1.Cu"),
+            ("In+1.Cu", "In1.Cu"),
+            ("User.07", "User.7"),
+            ("In30.Cu", "In30.Cu"),
+            ("User.45", "User.45"),
+            ("Edge.Cuts", "Edge.Cuts"),
+        ] {
+            let layer = board_layer_arg(&json!({ "layer": given }), None).unwrap();
+            assert_eq!(layer.name, given);
+            assert_eq!(layer.file_name, file_name, "{given}");
+            assert!(
+                konnect_sexp::layers::is_canonical_name(layer.file_name),
+                "{given}"
             );
         }
     }
@@ -2648,8 +2702,8 @@ async fn handle_add_board_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let layer = match board_layer_arg(args, Some("F.SilkS")) {
-        Ok(v) => v,
+    let (layer, file_layer) = match board_layer_arg(args, Some("F.SilkS")) {
+        Ok(v) => (v.name, v.file_name),
         Err(e) => return Ok(e),
     };
     let size = args["size"].as_f64().unwrap_or(1.0);
@@ -2674,7 +2728,7 @@ async fn handle_add_board_text(
         BoardWrite::File(reason) => reason,
     };
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
+    let gr_text = format_gr_text(&text, x, y, rotation, file_layer, size);
     let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     if let Some(conflict) = write_board_edits(
@@ -2711,8 +2765,8 @@ pub(crate) async fn add_zone_impl(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = match board_layer_arg(args, None) {
-        Ok(v) => v,
+    let (layer, file_layer) = match board_layer_arg(args, None) {
+        Ok(v) => (v.name, v.file_name),
         Err(e) => return Ok(e),
     };
     let clearance = args["clearance"]
@@ -2796,7 +2850,14 @@ pub(crate) async fn add_zone_impl(
         )));
     };
     let zone_sexp = format_zone_polygon(
-        &net, &layer, clearance, min_width, &points, &zone_name, priority, connection,
+        &net,
+        file_layer,
+        clearance,
+        min_width,
+        &points,
+        &zone_name,
+        priority,
+        connection,
     );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
@@ -2835,8 +2896,8 @@ async fn handle_import_svg_logo(
     };
     let x = args["x"].as_f64().unwrap_or(0.0);
     let y = args["y"].as_f64().unwrap_or(0.0);
-    let layer = match board_layer_arg(args, Some("F.SilkS")) {
-        Ok(v) => v,
+    let (layer, file_layer) = match board_layer_arg(args, Some("F.SilkS")) {
+        Ok(v) => (v.name, v.file_name),
         Err(e) => return Ok(e),
     };
 
@@ -2873,7 +2934,7 @@ async fn handle_import_svg_logo(
 
     let mut sexp = String::new();
     for polygon in &placed {
-        sexp.push_str(&format_gr_poly(polygon, &layer));
+        sexp.push_str(&format_gr_poly(polygon, file_layer));
     }
     let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());

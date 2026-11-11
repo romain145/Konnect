@@ -232,6 +232,12 @@ async fn a_known_layer_still_reaches_kicad_as_that_layer() {
     let cases = [
         ("add_board_text", None, BoardLayer::BlFSilkS),
         ("add_board_text", Some("B.SilkS"), BoardLayer::BlBSilkS),
+        // Over IPC an alias is the enum value, so it stays accepted (#126).
+        (
+            "add_board_text",
+            Some("F.Silkscreen"),
+            BoardLayer::BlFSilkS,
+        ),
         ("import_svg_logo", None, BoardLayer::BlFSilkS),
         ("import_svg_logo", Some("F.Cu"), BoardLayer::BlFCu),
         ("add_zone", Some("In1.Cu"), BoardLayer::BlIn1Cu),
@@ -276,5 +282,50 @@ async fn a_known_layer_is_still_written_to_the_file() {
             before.matches(written).count() + 1,
             "{tool}"
         );
+    }
+}
+
+/// #126: the layer map takes KiCad's display names and loose inner copper
+/// numbers, which KiCad 10.0.6 refuses to load from a board file. The file
+/// path writes the layer's canonical name instead; the response still echoes
+/// the name the caller gave, as it does over IPC.
+#[tokio::test]
+async fn an_accepted_alias_is_written_to_the_file_under_its_canonical_name() {
+    let quoted = |name: &str| format!("\"{name}\"");
+    let scene = Scene::new(false).await;
+    for tool in ["add_board_text", "import_svg_logo", "add_zone"] {
+        for (given, canonical) in [
+            ("F.Silkscreen", "F.SilkS"),
+            ("User.Drawings", "Dwgs.User"),
+            ("In01.Cu", "In1.Cu"),
+        ] {
+            assert!(konnect_sexp::layers::is_canonical_name(canonical));
+            let before = std::fs::read_to_string(&scene.board).unwrap();
+
+            let result = scene.call(tool, Some(given)).await;
+
+            let case = format!("{tool} {given}");
+            assert!(!result.is_error, "{case}: {:?}", result.content);
+            let response = body(&result);
+            assert_eq!(response["source"], "file", "{case}");
+            assert_eq!(response["layer"], given, "{case}");
+            let after = std::fs::read_to_string(&scene.board).unwrap();
+            assert_eq!(
+                after.matches(quoted(canonical).as_str()).count(),
+                before.matches(quoted(canonical).as_str()).count() + 1,
+                "{case}: the new item is not on {canonical}"
+            );
+            // The stackup's own `(5 "F.SilkS" user "F.Silkscreen")` is why
+            // this compares counts instead of asserting absence.
+            assert_eq!(
+                after.matches(quoted(given).as_str()).count(),
+                before.matches(quoted(given).as_str()).count(),
+                "{case}: {given} was written into the board"
+            );
+            for form in ["(layer ", "(layers "] {
+                let item_layer = format!("{form}{}", quoted(given));
+                assert!(!after.contains(&item_layer), "{case}");
+            }
+        }
     }
 }
