@@ -122,6 +122,11 @@ message RunActionResponse
  */
 message BeginCommit
 {
+  // Specifies which document to associate the commit with.
+  // KiCad 10.0.7+ refuses an empty BeginCommit when more than one editor is open.
+  //
+  // Since: 10.0.7
+  kiapi.common.types.ItemHeader header = 1;
 }
 
 
@@ -150,6 +155,11 @@ message EndCommit
 
   // Optional message describing this changeset
   string message = 3;
+
+  // Specifies which document to associate the commit with.
+  //
+  // Since: 10.0.7
+  kiapi.common.types.ItemHeader header = 4;
 }
 
 
