@@ -50,19 +50,11 @@ pub fn tools() -> Vec<ToolDef> {
             "set_design_rules",
             "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
              project file. Refuses while KiCad holds the board open, because KiCad's next save \
-             rewrites the project file from its own copy.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "min_clearance": { "type": "number", "description": "Minimum clearance in mm" },
-                    "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
-                    "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
-                    "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
-                },
-                "required": ["board"]
-            }),
+             rewrites the project file from its own copy. Each value must lie in the range \
+             KiCad loads (the schema's minimum and maximum): KiCad replaces a value outside it \
+             with its default when it opens the project, so such a value is refused and \
+             nothing is written.",
+            set_design_rules_schema(),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
         ),
         tool!(
@@ -364,6 +356,130 @@ fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
 }
 
+/// One board-wide minimum in the project file's
+/// `board.design_settings.rules`.
+struct DesignRule {
+    /// The `set_design_rules` argument and the `get_design_rules` key.
+    argument: &'static str,
+    /// KiCad's key in the project file.
+    project_key: &'static str,
+    /// The inclusive range, in mm, that KiCad loads. Outside it KiCad drops
+    /// the stored value for its own default when it opens the project, and
+    /// DRC then runs with a limit nobody asked for (#196).
+    range_mm: (f64, f64),
+    description: &'static str,
+}
+
+/// The minima `set_design_rules` writes and `get_design_rules` reports.
+///
+/// Each `range_mm` is the `PARAM_SCALED` min/max KiCad 10.0 registers for the
+/// key in `pcbnew/board_design_settings.cpp`; its `Load` keeps a value that
+/// lies between them, bounds included, and takes the default otherwise. #196
+/// measured that on KiCad 10.0.6 for the first five keys: -0.01, 25.01 and
+/// (for `min_hole_to_hole`) 10.01 each loaded as the default.
+fn design_rules() -> &'static [DesignRule] {
+    &[
+        DesignRule {
+            argument: "min_clearance",
+            project_key: "min_clearance",
+            range_mm: (0.0, 25.0),
+            description: "Minimum clearance in mm",
+        },
+        DesignRule {
+            argument: "min_trace_width",
+            project_key: "min_track_width",
+            range_mm: (0.0, 25.0),
+            description: "Minimum trace width in mm",
+        },
+        DesignRule {
+            argument: "min_via_drill",
+            project_key: "min_through_hole_diameter",
+            range_mm: (0.0, 25.0),
+            description: "Minimum via drill diameter in mm",
+        },
+        DesignRule {
+            argument: "min_via_size",
+            project_key: "min_via_diameter",
+            range_mm: (0.0, 25.0),
+            description: "Minimum via pad diameter in mm",
+        },
+        DesignRule {
+            argument: "min_hole_to_hole",
+            project_key: "min_hole_to_hole",
+            range_mm: (0.0, 10.0),
+            description: "Minimum hole-to-hole clearance in mm",
+        },
+    ]
+}
+
+/// `set_design_rules`' input schema, with each rule's range advertised as
+/// `minimum`/`maximum` so the served dispatch refuses a value outside it
+/// before the handler runs.
+fn set_design_rules_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "board".into(),
+        json!({ "type": "string", "description": "Path to .kicad_pcb file" }),
+    );
+    for rule in design_rules() {
+        let (minimum, maximum) = rule.range_mm;
+        properties.insert(
+            rule.argument.into(),
+            json!({
+                "type": "number",
+                "minimum": minimum,
+                "maximum": maximum,
+                "description": format!(
+                    "{}. KiCad loads {minimum} to {maximum} mm and resets any other value to its default.",
+                    rule.description
+                )
+            }),
+        );
+    }
+    json!({ "type": "object", "properties": properties, "required": ["board"] })
+}
+
+/// The value the caller named for `rule`, if any. A value KiCad would not
+/// load is refused here as well as by the schema, because a handler reached
+/// without the served dispatch must not write it either.
+fn design_rule_argument(args: &Value, rule: &DesignRule) -> Result<Option<f64>, CallToolResult> {
+    let value = match args.get(rule.argument) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value.as_f64().ok_or_else(|| {
+            crate::tools::invalid_arg(rule.argument, "not a number (millimetres)")
+        })?,
+    };
+    let (minimum, maximum) = rule.range_mm;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(crate::tools::invalid_arg(
+            rule.argument,
+            &format!(
+                "{value} mm is outside the {minimum} to {maximum} mm KiCad loads for '{}'; KiCad \
+                 would replace it with its default when it opens the project, so nothing was \
+                 written",
+                rule.project_key
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Every rule in the table as `get_design_rules` reports it: the stored
+/// value, or null where the project file has none.
+fn design_rules_readback(project: &Value) -> Value {
+    Value::Object(
+        design_rules()
+            .iter()
+            .map(|rule| {
+                (
+                    rule.argument.to_string(),
+                    json!(project_rule_value(project, rule.project_key)),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     let needle = format!("(rule \"{name}\"");
     let start = content.find(&needle)?;
@@ -428,6 +544,16 @@ async fn handle_set_design_rules(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    // Before anything is read or asked of KiCad: one bad value refuses the
+    // whole call, so no rule named beside it is written either.
+    let mut requested = Vec::new();
+    for rule in design_rules() {
+        match design_rule_argument(args, rule) {
+            Ok(Some(value)) => requested.push((rule, value)),
+            Ok(None) => {}
+            Err(refusal) => return Ok(refusal),
+        }
+    }
     // KiCad rewrites the project file from memory when it saves the board, so
     // a rule written here while it holds the board is reverted (#791). Asked
     // before the read too: the file can be older than what KiCad holds.
@@ -442,25 +568,10 @@ async fn handle_set_design_rules(
 
     let mut changed = Vec::new();
 
-    let rules: &[(&str, &str)] = &[
-        ("min_clearance", "min_clearance"),
-        ("min_track_width", "min_trace_width"),
-        ("min_through_hole_diameter", "min_via_drill"),
-        ("min_via_size", "min_via_size"),
-        ("min_hole_to_hole", "min_hole_to_hole"),
-    ];
-
     let project_rules = project_rules_mut(&mut project)?;
-    for (project_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
-            let storage_key = if *project_key == "min_via_size" {
-                "min_via_diameter"
-            } else {
-                project_key
-            };
-            project_rules.insert(storage_key.to_string(), json!(val));
-            changed.push(format!("{} = {}", storage_key, val));
-        }
+    for (rule, value) in requested {
+        project_rules.insert(rule.project_key.to_string(), json!(value));
+        changed.push(format!("{} = {}", rule.project_key, value));
     }
 
     if !changed.is_empty() {
@@ -501,13 +612,7 @@ async fn handle_get_design_rules(
         serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
             "project": project_path.to_str().unwrap_or(""),
-            "rules": {
-                "min_clearance": project_rule_value(&project, "min_clearance"),
-                "min_trace_width": project_rule_value(&project, "min_track_width"),
-                "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
-                "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
-            }
+            "rules": design_rules_readback(&project)
         }))
         .unwrap(),
     ))
@@ -1534,6 +1639,12 @@ fn find_footprint_position(
 
     Ok((fp_x, fp_y))
 }
+
+// Declared here rather than in `tools/mod.rs` so the tests reach this module's
+// private rule table and handlers.
+#[cfg(test)]
+#[path = "design_rules_tests.rs"]
+mod design_rules_tests;
 
 #[cfg(test)]
 mod tests {
