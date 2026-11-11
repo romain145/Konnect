@@ -330,7 +330,7 @@ and Windows servers do not.
 | `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. Without `layers`, plots the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
-| `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
+| `export_netlist` | Export a netlist file: `ipc` writes the board's IPC-D-356 netlist; `kicad` writes a KiCAD netlist from the root schematic beside the board (refused if it does not exist). |
 | `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board. The Rust exporter is the default. On KiCad 10, explicitly set `native_bridge_mode` to `prefer` or `require` for the optional authenticated ActionPlugin native exporter. Preserves locked straight tracks and through vias as fixed wiring; refuses unlocked routing, arcs, unsupported geometry, or incomplete rules. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |

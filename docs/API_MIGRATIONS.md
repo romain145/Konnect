@@ -3,6 +3,91 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: project-file writers refuse a project file that changed mid-edit (patch release)
+
+`set_design_rules`, `set_predefined_sizes`, `create_netclass` and
+`assign_net_to_class` edit the board's sibling `.kicad_pro`. They used to read
+the file, change the JSON and replace the file unconditionally, so a save that
+landed in between (KiCad, an editor, another call) was overwritten with the
+older image of the whole project file, and the call still reported success.
+
+The write now goes through only while the file still holds the text that was
+read. Otherwise the call returns `conflict` with the project file in `paths`
+and leaves the newer file as it is; retry the call. If the file no longer
+holds the edit when read back after the write, the call returns
+`mutation_outcome_uncertain`; inspect the project file before retrying.
+Successful responses are unchanged (#197).
+
+## Unreleased: export_netlist exports IPC-D-356 from the board and KiCad netlists from the schematic (patch release)
+
+`export_netlist` ran `kicad-cli sch export netlist` on the `.kicad_pcb` for
+every format. That command does not load a board and has no IPC-D-356 format,
+so `format: "ipc"` failed with "Invalid format" and `format: "kicad"` with
+"Failed to load schematic". `format: "ipc"` (also `ipcd356`, `ipc-d-356`,
+`d356`) now runs `pcb export ipcd356` on the board. A KiCad-format netlist can
+only come from the schematic: given a `.kicad_pcb`, it is exported from the
+root schematic of the same name beside the board and the response names it in
+the new `source_schematic` field; when that schematic does not exist the call
+returns `invalid_argument` with `field: "board"` before kicad-cli runs, and
+points to `generate_netlist`. `format: "ipc"` with a `.kicad_sch` path is
+refused the same way. A `.kicad_sch` path with a schematic format still works
+and now also reports `source_schematic`. No argument was removed (#199).
+
+## Unreleased: `connect_to_net` writes no wire for `stub_length: 0` (patch release)
+
+`connect_to_net` with `stub_length: 0` used to write a wire whose two ends
+were the pin, then the label. It now writes no wire and puts the label on the
+pin, as `batch_connect_to_net` does, and the response has no `wire` field in
+that case; `connected`, `direction` and `label` are unchanged. The schema
+declares `"minimum": 0`, and a negative `stub_length` is refused as
+`invalid_argument` with `field: "stub_length"` before the file is read. A
+positive length behaves as before (#186).
+
+## Unreleased: `add_power_symbol` numbers `PWR_FLAG` as `#FLG` (patch release)
+
+`add_power_symbol` built every designator from a fixed `#PWR` prefix, so
+`power:PWR_FLAG` was placed as `#PWR01`. The prefix now comes from the
+library symbol's Reference (`#FLG` for `PWR_FLAG`), with `#PWR` as the
+fallback when the definition names none, and each prefix takes the lowest
+number free on the sheet for that prefix, as eeschema numbers them: a flag
+and a rail on a fresh sheet are `#FLG01` and `#PWR01`. Symbols already on a
+sheet are not renumbered. Arguments and response shape are unchanged (#146).
+
+## Unreleased: the JLCPCB package accepts a reference containing a hyphen (patch release)
+
+`export_manufacturing_package` with `fab_house: "jlcpcb"` refused its own BOM
+when a part's reference contained `-`, such as `SMB-19-A1`: the BOM was written
+correctly but reported as a "compressed designator range", left out of the
+verified file list, and the package returned `complete: false`. KiCad allows
+`-` in a reference and Konnect already exports this BOM with an empty range
+delimiter, so a hyphen alone is no longer treated as a range. A designator is
+still refused when it has the shape of a range (`C1-C3`: same prefix, ascending
+number) and the position file does not hold it as one part. Arguments and
+response shapes are unchanged (#161).
+
+## Unreleased: board file fallbacks write the canonical layer name (patch release)
+
+`add_board_text`, `import_svg_logo`, `add_zone` and `add_copper_pour` accept
+KiCad's display names for a layer (`F.Silkscreen`, `F.Courtyard`,
+`F.Adhesive`, `User.Drawings`, `User.Comments`, `User.Eco1`, ...) and loose
+inner copper numbers (`In01.Cu`). With no live KiCad they wrote that string
+into the board file as given, and KiCad 10.0.6 refuses to load a board whose
+items name a layer that way. The file path now writes the layer's canonical
+name (`F.SilkS`, `F.CrtYd`, `F.Adhes`, `Dwgs.User`, `Cmts.User`, `Eco1.User`,
+`In1.Cu`). The response still echoes the `layer` the caller gave, the IPC
+path is unchanged, and a name KiCad has no board layer for is still refused
+as `invalid_argument` with `field: "layer"` (#126).
+
+## Unreleased: millimetres sent to KiCad over IPC are rounded to the nearest nanometre (patch release)
+
+`konnect_ipc::builders::mm_to_nm` truncated toward zero, so a decimal value
+that is not exact in binary lost a nanometre: 4.1 mm was sent as 4 099 999 nm.
+Every IPC point, distance, pad, via, graphic and transform went through it.
+The conversion now rounds (half away from zero, symmetric for negative
+values). No tool arguments change; coordinates written over IPC can differ by
+1 nm from earlier versions, and items placed by an earlier version keep the
+value they were stored with (#92).
+
 ## Unreleased: board text, logo and zone writers refuse an unknown layer (patch release)
 
 `add_board_text`, `import_svg_logo`, `add_zone` and `add_copper_pour` now
