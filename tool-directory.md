@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **234 registered tools** + **7 always-visible meta-tools** = **241 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -397,15 +397,17 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 10 tools
+### `verification` · 12 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. The summary's `ignored_checks` lists the checks KiCad had switched off (severity `ignore`): they were not run, so a count of zero says nothing about them. |
 | `set_design_rules` | Set board-wide DRC minima in the sibling `.kicad_pro` project file: clearance, trace width, via size and drill, hole to hole, copper to board edge (`min_copper_edge_clearance`), and silkscreen text height and thickness (`min_text_height`, `min_text_thickness`). Omitted values are kept, a call that changes nothing does not rewrite the file, and the response carries the rules re-read from the saved file. The board file is not modified. Each value must lie in the range KiCad loads (0 to 25 mm; 0 to 10 mm for `min_hole_to_hole`, 0 to 100 mm for `min_text_height`), which the schema advertises as `minimum`/`maximum`: KiCad resets a value outside it to its default on load, so it is refused as `invalid_argument` and nothing is written. |
 | `get_design_rules` | Return the board-wide DRC minima from the sibling `.kicad_pro` project file, including copper-to-edge clearance and the silkscreen text minima; a rule the file does not hold is `null`. |
+| `get_drc_severities` | Return the severity (`error`, `warning`, `ignore`) of every DRC check in the sibling `.kicad_pro` (Board Setup → Design Rules → Violation Severity), with `ignored_checks` listing the ones switched off. Always reads the project file (`source: "project_file"`); `board_open_in_kicad` says whether KiCad holds the board, in which case the file can be older than what KiCad holds. |
+| `set_drc_severities` | Merge a map of check key → `error` / `warning` / `ignore` into the sibling `.kicad_pro`. Checks not named keep their severity, a call that changes nothing does not rewrite the file, and the response carries the severities re-read from the saved file. A key the project's KiCad did not save, or any other value, is refused as `invalid_argument`. Refuses while KiCad holds the board open, and returns `conflict` if the project file changed between read and write. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |

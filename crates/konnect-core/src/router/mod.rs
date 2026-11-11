@@ -201,6 +201,9 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
+                        // Keyed by KiCad's DRC check names, which differ
+                        // between KiCad releases; values are a closed enum.
+                        "set_drc_severities/properties/severities" |
                         "apply_template/properties/net_mappings"
                     ),
                         "unreviewed open input record: {path}"

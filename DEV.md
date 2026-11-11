@@ -110,7 +110,7 @@ Konnect/
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
 │   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting MCP, datasheets)
-│   │           ├── verification.rs   # 10 tools (DRC, design rules, KiCAD UI)
+│   │           ├── verification.rs   # 12 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
 │   │           ├── templates.rs      # 4 tools (6 built-in reference circuit templates)
@@ -366,7 +366,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 232 tools (239 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 234 tools (241 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -451,12 +451,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **21 toolsets, 232 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **21 toolsets, 234 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 239 tools (232 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 241 tools (234 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.
