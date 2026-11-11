@@ -211,7 +211,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_power_symbol",
             "Add a power symbol (VCC, GND, etc.) to the schematic. Snaps the position to the \
              1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
-             internal #PWR reference to the lowest number free on the sheet. Preserves every \
+             internal reference under the library's prefix (#PWR; #FLG for PWR_FLAG) to the \
+             lowest number free on the sheet for that prefix. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
             json!({
@@ -2096,17 +2097,24 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
-/// The lowest `#PWR` number no symbol on the sheet is using.
+/// The reference prefix a power symbol is numbered under when its library
+/// definition names none.
+const DEFAULT_POWER_PREFIX: &str = "#PWR";
+
+/// The lowest number no symbol on the sheet is using under `prefix`.
+///
+/// Each prefix is its own series, as in eeschema: `#FLG01` and `#PWR01` sit
+/// on one sheet (#146).
 ///
 /// Counting the power symbols instead re-issues a live designator after a
 /// deletion: drop `#PWR028` from a sheet of 29 and the count is 28, so the
 /// next symbol is handed `#PWR029` — still in use, silently duplicated.
-fn next_pwr_number(sch: &cse::Schematic) -> u32 {
+fn next_power_number(sch: &cse::Schematic, prefix: &str) -> u32 {
     let used: std::collections::HashSet<u32> = sch
         .symbols
         .iter()
         .filter_map(|s| s.reference())
-        .filter_map(|r| r.strip_prefix("#PWR"))
+        .filter_map(|r| r.strip_prefix(prefix))
         .filter_map(|n| n.parse::<u32>().ok())
         .collect();
     (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
@@ -2146,11 +2154,6 @@ async fn handle_add_power_symbol(
         return Ok(error.into_tool_result());
     }
 
-    // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
-    // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
-    // same number beside every eeschema-numbered symbol (#583).
-    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(&sch));
-
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
     let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
@@ -2163,6 +2166,18 @@ async fn handle_add_power_symbol(
     let metadata = cse::library::symbol_metadata(&sch, &lib_id);
     let placement_fields =
         super::sch_components::PlacementFields::resolve(&lib_id, &metadata, Some(&power_net), None);
+
+    // The prefix is the library's, as for any other placed symbol: `#PWR` for
+    // a rail, `#FLG` for `PWR_FLAG`, which eeschema numbers as its own series
+    // (#146). Spelled by the rule `annotate_schematic` uses, which is
+    // eeschema's: `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second
+    // spelling of the same number beside every eeschema-numbered symbol (#583).
+    let prefix = match metadata.reference.trim() {
+        "" => DEFAULT_POWER_PREFIX,
+        prefix => prefix,
+    };
+    let pwr_ref =
+        super::sch_annotate::format_designator(prefix, next_power_number(&sch, prefix));
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -4569,6 +4584,80 @@ mod power_symbol_tests {
             !sch.symbols.iter().any(|s| s.reference() == Some("#PWR100")),
             "and not the old one"
         );
+    }
+
+    /// A fresh sheet embedding `power:GND` and `power:PWR_FLAG` with the
+    /// Reference prefixes KiCad 10's `power.kicad_sym` gives them, and a
+    /// `power:BARE` whose definition names no prefix at all.
+    fn sheet_with_flag_and_gnd(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("flag.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\" (at 0 1.905 0))\n      (property \"Value\" \"PWR_FLAG\" (at 0 3.81 0))\n    )\n    (symbol \"power:BARE\"\n      (property \"Reference\" \"\" (at 0 1.905 0))\n      (property \"Value\" \"BARE\" (at 0 3.81 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+        path
+    }
+
+    /// Place `power:<power_net>` and return the designator the tool reported.
+    async fn add_power(path: &std::path::Path, power_net: &str, x: f64) -> String {
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": power_net,
+                "x": x,
+                "y": 25.4
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body: serde_json::Value = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected a JSON text response, got {other:?}"),
+        };
+        body["reference"].as_str().unwrap().to_string()
+    }
+
+    /// #146: `PWR_FLAG` was numbered `#PWR01` from a hard-coded prefix. Its
+    /// library Reference is `#FLG`, and eeschema numbers that series apart
+    /// from `#PWR`.
+    #[tokio::test]
+    async fn pwr_flag_is_numbered_under_the_librarys_flg_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet_with_flag_and_gnd(dir.path());
+
+        assert_eq!(add_power(&path, "PWR_FLAG", 25.4).await, "#FLG01");
+        assert_eq!(add_power(&path, "GND", 38.1).await, "#PWR01");
+        assert_eq!(add_power(&path, "PWR_FLAG", 50.8).await, "#FLG02");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for designator in ["#FLG01", "#PWR01", "#FLG02"] {
+            assert_eq!(
+                designator_spellings(&after, designator),
+                (1, 1),
+                "{designator} is written once as the property and once in the instance record"
+            );
+        }
+        let sch = cse::Schematic::load(&path).unwrap();
+        let flag = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#FLG01"))
+            .expect("the flag is on the sheet");
+        assert_eq!(flag.lib_id, "power:PWR_FLAG");
+    }
+
+    /// A definition with an empty Reference falls back to `#PWR`, and shares
+    /// that series with the rails already on the sheet.
+    #[tokio::test]
+    async fn a_library_symbol_without_a_prefix_falls_back_to_pwr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet_with_flag_and_gnd(dir.path());
+
+        assert_eq!(add_power(&path, "GND", 25.4).await, "#PWR01");
+        assert_eq!(add_power(&path, "BARE", 38.1).await, "#PWR02");
     }
 
     /// A sheet that already holds Konnect's older `#PWR001` and `#PWR002`
