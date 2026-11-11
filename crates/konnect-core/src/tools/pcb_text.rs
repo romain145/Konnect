@@ -23,8 +23,8 @@ use crate::tools::{
 use konnect_ipc::client::{FootprintTargetError, KiCadIpcClient, TextTargetError};
 use konnect_ipc::gen::kiapi::common::types::DocumentSpecifier;
 use konnect_ipc::{
-    IpcBoardTextItem, IpcBox2, IpcFootprintField, IpcFootprintFieldSlot, IpcTextEdit,
-    IpcTextEditOutcome, IpcTextState,
+    IpcBoardTextItem, IpcBox2, IpcFootprintField, IpcFootprintFieldSlot, IpcHorizontalAlignment,
+    IpcTextEdit, IpcTextEditOutcome, IpcTextState, IpcVerticalAlignment,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -35,8 +35,34 @@ use std::path::Path;
 const MAX_TEXT_SIZE_MM: f64 = 250.0;
 
 const EDITABLE_FIELD_PROPERTIES: &str =
-    "x and y, rotation, size_x, size_y, thickness, visible, layer";
-const EDITABLE_TEXT_PROPERTIES: &str = "x and y, rotation, size_x, size_y, thickness, layer, text";
+    "x and y, rotation, size_x, size_y, thickness, visible, layer, mirrored, \
+     horizontal_alignment, vertical_alignment, bold, italic, keep_upright, knockout, locked, font";
+const EDITABLE_TEXT_PROPERTIES: &str =
+    "x and y, rotation, size_x, size_y, thickness, layer, text, mirrored, horizontal_alignment, \
+     vertical_alignment, bold, italic, keep_upright, knockout, locked, font";
+
+/// The style properties `edit_board_text` and `edit_footprint_field` share,
+/// added to each tool's own schema properties.
+fn with_style_properties(mut schema: Value) -> Value {
+    let style = json!({
+        "mirrored":             { "type": "boolean", "description": "Draw the glyphs mirrored. Text on a back layer (B.SilkS, B.Fab, B.Cu) must be mirrored to read correctly from the back of the board" },
+        "horizontal_alignment": { "type": "string", "enum": ["left", "center", "right"], "description": "Which side of the text its position anchors" },
+        "vertical_alignment":   { "type": "string", "enum": ["top", "center", "bottom"] },
+        "bold":                 { "type": "boolean", "description": "Sets the bold flag only; the stroke is changed with 'thickness'" },
+        "italic":               { "type": "boolean" },
+        "keep_upright":         { "type": "boolean", "description": "Let KiCad draw the text within 90 degrees of upright whatever its angle" },
+        "knockout":             { "type": "boolean", "description": "Draw the text as a cut-out in a filled box" },
+        "locked":               { "type": "boolean" },
+        "font":                 { "type": "string", "description": "Font face name, e.g. 'Arial'; the empty string selects KiCad's stroke font" }
+    });
+    let properties = schema["properties"]
+        .as_object_mut()
+        .expect("a text edit schema has properties");
+    for (key, value) in style.as_object().expect("an object literal") {
+        properties.insert(key.clone(), value.clone());
+    }
+    schema
+}
 
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![
@@ -65,16 +91,17 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         .with_board_access(BoardAccess::LiveOnly),
         tool!(
             "edit_footprint_field",
-            "Move, rotate, resize, hide/show, or change the layer of a placed footprint's \
+            "Move, rotate, resize, hide/show, restyle (mirrored, alignment, bold, italic, \
+             keep_upright, knockout, locked, font), or change the layer of a placed footprint's \
              reference or value field in place. Name at least one property; every property not \
-             named — font, alignment, text, mirroring — is sent back exactly as KiCad holds it. \
-             x/y are board-absolute mm (both or neither); rotation is the field's absolute angle \
-             in degrees, the same frame list_footprint_fields reports. Changing the layer does \
-             not mirror the text. One KiCad undo step; the result is a fresh readback of what \
-             the board holds, and a readback that does not match the request is reported as an \
-             error rather than success. Does not save. Requires KiCAD running with the board \
-             open.",
-            json!({
+             named is sent back exactly as KiCad holds it. x/y are board-absolute mm (both or \
+             neither); rotation is the field's absolute angle in degrees, the same frame \
+             list_footprint_fields reports. Changing the layer does not mirror the text; pass \
+             'mirrored' with it for a back layer. One KiCad undo step; the result is a fresh \
+             readback of what the board holds, and a readback that does not match the request \
+             (for example a KiCad that ignores one of the properties) is reported as an error \
+             rather than success. Does not save. Requires KiCAD running with the board open.",
+            with_style_properties(json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
@@ -90,7 +117,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "layer":     { "type": "string", "description": "Target layer, e.g. 'F.Fab'" }
                 },
                 "required": ["board", "reference"]
-            }),
+            })),
             |args, ctx| async move { handle_edit_footprint_field(args, ctx).await }
         )
         .with_board_access(BoardAccess::LiveOnly),
@@ -115,16 +142,18 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         .with_board_access(BoardAccess::LiveOnly),
         tool!(
             "edit_board_text",
-            "Move, rotate, resize, re-layer, or re-word one board-level text item in place, \
+            "Move, rotate, resize, re-layer, re-word, or restyle (mirrored, alignment, bold, \
+             italic, keep_upright, knockout, locked, font) one board-level text item in place, \
              selected by UUID (from list_board_texts). Name at least one property; everything \
              not named — font face, non-square size, alignment, the raw text with any \
-             ${VARIABLE} — is sent back exactly as KiCad holds it. When 'text' is omitted the \
-             live text is checked against the saved board, and the edit is refused if a text \
+             ${VARIABLE} — is sent back exactly as KiCad holds it. Changing the layer does not \
+             mirror the text; pass 'mirrored' with it for a back layer. When 'text' is omitted \
+             the live text is checked against the saved board, and the edit is refused if a text \
              variable the saved file holds is missing from it; pass 'text' with the exact raw \
              string to write it verbatim. One KiCad undo step; the result is a fresh readback, \
-             and a mismatch is reported as an error. Does not save. Requires KiCAD running with \
-             the board open.",
-            json!({
+             and a mismatch (for example a KiCad that ignores one of the properties) is reported \
+             as an error. Does not save. Requires KiCAD running with the board open.",
+            with_style_properties(json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
@@ -139,7 +168,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "text":      { "type": "string", "description": "Replacement raw text, written verbatim (variables are not expanded)" }
                 },
                 "required": ["board", "uuid"]
-            }),
+            })),
             |args, ctx| async move { handle_edit_board_text(args, ctx).await }
         )
         .with_board_access(BoardAccess::LiveOnly),
@@ -278,6 +307,34 @@ fn parse_text_edit(
         }
         Some(text) => Some(text.to_string()),
     };
+    let horizontal_alignment = match opt_string(args, "horizontal_alignment")? {
+        None => None,
+        Some(name) => Some(IpcHorizontalAlignment::from_name(name).ok_or_else(|| {
+            invalid_arg(
+                "horizontal_alignment",
+                "must be 'left', 'center' or 'right'",
+            )
+        })?),
+    };
+    let vertical_alignment = match opt_string(args, "vertical_alignment")? {
+        None => None,
+        Some(name) => Some(IpcVerticalAlignment::from_name(name).ok_or_else(|| {
+            invalid_arg("vertical_alignment", "must be 'top', 'center' or 'bottom'")
+        })?),
+    };
+    let font_name = match opt_string(args, "font")? {
+        None => None,
+        // A face name is one line of printable text. KiCad stores whatever
+        // it is given, so anything else would come back intact and "prove"
+        // an edit that names no font at all.
+        Some(font) if font.chars().any(char::is_control) => {
+            return Err(invalid_arg("font", "must not contain control characters"))
+        }
+        Some(font) if font != font.trim() => {
+            return Err(invalid_arg("font", "must not start or end with whitespace"))
+        }
+        Some(font) => Some(font.to_string()),
+    };
     let edit = IpcTextEdit {
         position_nm,
         angle_deg,
@@ -287,6 +344,15 @@ fn parse_text_edit(
         layer,
         text,
         visible,
+        mirrored: opt_bool(args, "mirrored")?,
+        horizontal_alignment,
+        vertical_alignment,
+        bold: opt_bool(args, "bold")?,
+        italic: opt_bool(args, "italic")?,
+        keep_upright: opt_bool(args, "keep_upright")?,
+        knockout: opt_bool(args, "knockout")?,
+        locked: opt_bool(args, "locked")?,
+        font_name,
     };
     if edit.is_empty() {
         let properties = if allow_visible {
@@ -1275,6 +1341,390 @@ mod tests {
             assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {body}");
             assert_eq!(body["error"]["field"], field, "{tool}: {body}");
         }
+    }
+
+    // ─── Served dispatch against a KiCad double ──────────────────────────────
+
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    /// What the KiCad double holds, and how it treats an update.
+    #[derive(Default)]
+    struct Held {
+        texts: Vec<kiapi::board::types::BoardText>,
+        footprints: Vec<kiapi::board::types::FootprintInstance>,
+        /// Accept an update but keep each text's mirror flag as it was: the
+        /// KiCad behaviour #202 could not rule out.
+        keep_mirror_flag: bool,
+        updates: usize,
+    }
+
+    fn held_text(
+        kiid: &str,
+        text: &str,
+        layer: &str,
+        mirrored: bool,
+    ) -> kiapi::board::types::BoardText {
+        let mut item = konnect_ipc::builders::board_text_with_stroke_width(
+            layer, text, 20.0, 30.0, 1.0, 0.15, 0.0, mirrored,
+        );
+        item.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        item
+    }
+
+    fn held_footprint(kiid: &str, reference: &str) -> kiapi::board::types::FootprintInstance {
+        let field = |id, name: &str, suffix: &str, text: &str, layer: &str| {
+            Some(kiapi::board::types::Field {
+                id: Some(kiapi::board::types::FieldId { id }),
+                name: name.to_string(),
+                text: Some(held_text(&format!("{kiid}-{suffix}"), text, layer, false)),
+                visible: true,
+            })
+        };
+        kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: kiid.to_string(),
+            }),
+            position: Some(konnect_ipc::builders::vec2(20.0, 30.0)),
+            orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+            reference_field: field(1, "Reference", "ref", reference, "F.SilkS"),
+            value_field: field(2, "Value", "val", "10k", "F.Fab"),
+            definition: Some(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    fn mirror_flag(text: &mut kiapi::board::types::BoardText) -> &mut bool {
+        &mut text
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .mirrored
+    }
+
+    fn spawn_text_kicad(
+        board: &Path,
+        held: Arc<Mutex<Held>>,
+    ) -> crate::test_support::MockIpcServer {
+        use kiapi::common::commands;
+        crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
+            let mut held = held.lock().unwrap();
+            let name = command.type_url.rsplit('.').next().unwrap();
+            match name {
+                "GetItems" => {
+                    let request = commands::GetItems::decode(command.value.as_slice()).unwrap();
+                    let mut items = Vec::new();
+                    for kind in request.types {
+                        if kind == kiapi::common::types::KiCadObjectType::KotPcbText as i32 {
+                            items.extend(held.texts.iter().map(|text| {
+                                konnect_ipc::builders::pack_any(text, "kiapi.board.types.BoardText")
+                            }));
+                        } else if kind
+                            == kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32
+                        {
+                            items.extend(held.footprints.iter().map(|footprint| {
+                                konnect_ipc::builders::pack_any(
+                                    footprint,
+                                    "kiapi.board.types.FootprintInstance",
+                                )
+                            }));
+                        }
+                    }
+                    Some(konnect_ipc::builders::pack_any(
+                        &commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                }
+                "BeginCommit" => Some(konnect_ipc::builders::pack_any(
+                    &commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "text-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )),
+                "EndCommit" => Some(konnect_ipc::builders::pack_any(
+                    &commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                )),
+                "UpdateItems" => {
+                    let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
+                    held.updates += request.items.len();
+                    let keep_mirror_flag = held.keep_mirror_flag;
+                    for item in &request.items {
+                        if item.type_url.ends_with("BoardText") {
+                            let mut updated =
+                                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                                    .unwrap();
+                            let slot = held
+                                .texts
+                                .iter_mut()
+                                .find(|text| text.id == updated.id)
+                                .expect("update names a held text");
+                            if keep_mirror_flag {
+                                *mirror_flag(&mut updated) = *mirror_flag(slot);
+                            }
+                            *slot = updated;
+                        } else {
+                            let mut updated = kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .unwrap();
+                            let slot = held
+                                .footprints
+                                .iter_mut()
+                                .find(|footprint| footprint.id == updated.id)
+                                .expect("update names a held footprint");
+                            if keep_mirror_flag {
+                                let old = slot.reference_field.as_mut().unwrap();
+                                let new = updated.reference_field.as_mut().unwrap();
+                                *mirror_flag(new.text.as_mut().unwrap()) =
+                                    *mirror_flag(old.text.as_mut().unwrap());
+                            }
+                            *slot = updated;
+                        }
+                    }
+                    Some(konnect_ipc::builders::pack_any(
+                        &commands::UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: request
+                                .items
+                                .iter()
+                                .map(|_| commands::ItemUpdateResult {
+                                    status: Some(commands::ItemStatus {
+                                        code: commands::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: None,
+                                })
+                                .collect(),
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A served handler talking to a KiCad double that holds one board with
+    /// one unmirrored text already on `B.SilkS` (the state #202 was filed
+    /// from) and one resistor.
+    struct LiveScene {
+        _dir: tempfile::TempDir,
+        board: std::path::PathBuf,
+        held: Arc<Mutex<Held>>,
+        _kicad: crate::test_support::MockIpcServer,
+        handler: crate::mcp::handler::McpHandler,
+    }
+
+    impl LiveScene {
+        async fn new(keep_mirror_flag: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("silk.kicad_pcb");
+            std::fs::write(&board, "(kicad_pcb\n\t(version 20250114)\n)\n").unwrap();
+            let held = Arc::new(Mutex::new(Held {
+                texts: vec![held_text("title", "Konnect rev A", "B.SilkS", false)],
+                footprints: vec![held_footprint("fp-r1", "R1")],
+                keep_mirror_flag,
+                updates: 0,
+            }));
+            let kicad = spawn_text_kicad(&board, held.clone());
+            let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: kicad.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: true,
+                eager_toolsets: false,
+            })
+            .await
+            .expect("handler builds");
+            Self {
+                _dir: dir,
+                board,
+                held,
+                _kicad: kicad,
+                handler,
+            }
+        }
+
+        /// `tools/call`, returning whether the result is an error and its
+        /// JSON body.
+        async fn call(&self, tool: &str, mut arguments: Value) -> (bool, Value) {
+            arguments["board"] = json!(self.board.to_string_lossy());
+            let response = self
+                .handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 202, "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("tool errors are MCP results");
+            let text = result["content"][0]["text"].as_str().expect("text content");
+            let body = serde_json::from_str(text)
+                .unwrap_or_else(|_| panic!("expected a JSON body, got {text}"));
+            (result["isError"] == true, body)
+        }
+    }
+
+    /// The issue's case end to end: the title already sits on `B.SilkS`
+    /// unmirrored, and one call sets the flag and nothing else.
+    #[tokio::test]
+    async fn the_served_edit_board_text_mirrors_a_back_side_text() {
+        let scene = LiveScene::new(false).await;
+        let (is_error, body) = scene
+            .call(
+                "edit_board_text",
+                json!({ "uuid": "title", "mirrored": true }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["status"], "applied");
+        assert_eq!(body["changed"], json!(["mirrored"]));
+        assert_eq!(body["before"]["mirrored"], false);
+        assert_eq!(body["after"]["mirrored"], true);
+        assert_eq!(body["after"]["layer"], "B.SilkS");
+        assert_eq!(body["after"]["text"], "Konnect rev A");
+
+        let (is_error, listing) = scene.call("list_board_texts", json!({})).await;
+        assert!(!is_error, "{listing}");
+        assert_eq!(listing["texts"][0]["mirrored"], true);
+
+        // Asking again changes nothing and sends nothing.
+        let (is_error, body) = scene
+            .call(
+                "edit_board_text",
+                json!({ "uuid": "title", "mirrored": true }),
+            )
+            .await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["status"], "unchanged");
+        assert_eq!(scene.held.lock().unwrap().updates, 1);
+    }
+
+    #[tokio::test]
+    async fn the_served_edits_set_every_style_property_and_report_it_from_readback() {
+        let scene = LiveScene::new(false).await;
+        let style = json!({
+            "mirrored": true, "horizontal_alignment": "left", "vertical_alignment": "top",
+            "bold": true, "italic": true, "keep_upright": true, "knockout": true,
+            "locked": true, "font": "Arial"
+        });
+        let expected_changed = BTreeSet::from([
+            "bold",
+            "font_name",
+            "horizontal_alignment",
+            "italic",
+            "keep_upright",
+            "knockout",
+            "locked",
+            "mirrored",
+            "vertical_alignment",
+        ]);
+        for (tool, target) in [
+            ("edit_board_text", json!({ "uuid": "title" })),
+            ("edit_footprint_field", json!({ "reference": "R1" })),
+        ] {
+            let mut arguments = style.clone();
+            for (key, value) in target.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            let (is_error, body) = scene.call(tool, arguments).await;
+            assert!(!is_error, "{tool}: {body}");
+            assert_eq!(body["status"], "applied", "{tool}");
+            let changed: BTreeSet<&str> = body["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(changed, expected_changed, "{tool}");
+            let after = &body["after"];
+            assert_eq!(after["font_name"], "Arial", "{tool}");
+            assert_eq!(after["horizontal_alignment"], "left", "{tool}");
+            assert_eq!(after["vertical_alignment"], "top", "{tool}");
+            // What the edit did not name is what KiCad held.
+            assert_eq!(after["x_mm"], 20.0, "{tool}");
+            assert_eq!(after["size_x_mm"], 1.0, "{tool}");
+            assert_eq!(after["thickness_mm"], 0.15, "{tool}");
+        }
+        // The value field of the edited footprint was sent back untouched.
+        let held = scene.held.lock().unwrap();
+        assert_eq!(
+            held.footprints[0].value_field,
+            held_footprint("fp-r1", "R1").value_field
+        );
+    }
+
+    /// A KiCad that accepts the update and keeps the old flag must produce an
+    /// error naming the property, not `applied`.
+    #[tokio::test]
+    async fn a_kicad_that_ignores_mirrored_is_an_error_through_the_served_dispatch() {
+        let scene = LiveScene::new(true).await;
+        for (tool, arguments, mismatch) in [
+            (
+                "edit_board_text",
+                json!({ "uuid": "title", "mirrored": true }),
+                "text.mirrored: expected true, observed false",
+            ),
+            (
+                "edit_footprint_field",
+                json!({ "reference": "R1", "mirrored": true, "layer": "B.SilkS" }),
+                "reference.mirrored: expected true, observed false",
+            ),
+        ] {
+            let (is_error, body) = scene.call(tool, arguments).await;
+            assert!(is_error, "{tool}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "mutation_outcome_uncertain",
+                "{tool}: {body}"
+            );
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(mismatch),
+                "{tool}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_style_values_are_refused_naming_the_field() {
+        for (args, field) in [
+            (
+                json!({ "horizontal_alignment": "middle" }),
+                "horizontal_alignment",
+            ),
+            (
+                json!({ "vertical_alignment": "indeterminate" }),
+                "vertical_alignment",
+            ),
+            (json!({ "mirrored": "yes" }), "mirrored"),
+            (json!({ "locked": 1 }), "locked"),
+            (json!({ "font": "Arial\n" }), "font"),
+            (json!({ "font": " Arial" }), "font"),
+        ] {
+            for (allow_visible, allow_text) in [(true, false), (false, true)] {
+                let refused = parse_text_edit(&args, allow_visible, allow_text).unwrap_err();
+                assert_eq!(invalid_field(&refused), field, "{args}");
+            }
+        }
+        // The empty string is a value: it selects the stroke font.
+        let edit = parse_text_edit(&json!({ "font": "" }), false, true).unwrap();
+        assert_eq!(edit.font_name.as_deref(), Some(""));
     }
 
     /// The refusals happen before any transport is dialled: the address in

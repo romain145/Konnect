@@ -911,6 +911,71 @@ pub struct IpcTextEdit {
     pub text: Option<String>,
     /// Field visibility. Footprint fields only.
     pub visible: Option<bool>,
+    /// Draw the glyphs mirrored, as text on a back layer must be to read
+    /// correctly from that side.
+    pub mirrored: Option<bool>,
+    pub horizontal_alignment: Option<IpcHorizontalAlignment>,
+    pub vertical_alignment: Option<IpcVerticalAlignment>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub keep_upright: Option<bool>,
+    pub knockout: Option<bool>,
+    pub locked: Option<bool>,
+    /// Font face name; the empty string selects KiCad's stroke font.
+    pub font_name: Option<String>,
+}
+
+/// A horizontal text alignment a caller may request. KiCad's
+/// `HA_INDETERMINATE` describes a mixed selection in its dialogs and is not a
+/// value one text can be given, so it has no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcHorizontalAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl IpcHorizontalAlignment {
+    /// The name `IpcTextState::horizontal_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Left, Self::Center, Self::Right]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
+}
+
+/// A vertical text alignment a caller may request; see
+/// [`IpcHorizontalAlignment`] for why there is no indeterminate variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcVerticalAlignment {
+    Top,
+    Center,
+    Bottom,
+}
+
+impl IpcVerticalAlignment {
+    /// The name `IpcTextState::vertical_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Center => "center",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Top, Self::Center, Self::Bottom]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
 }
 
 impl IpcTextEdit {

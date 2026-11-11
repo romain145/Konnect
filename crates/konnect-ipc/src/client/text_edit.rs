@@ -84,6 +84,24 @@ fn vertical_alignment_name(value: i32) -> String {
     .to_string()
 }
 
+fn horizontal_alignment_value(alignment: IpcHorizontalAlignment) -> i32 {
+    use common::HorizontalAlignment as H;
+    (match alignment {
+        IpcHorizontalAlignment::Left => H::HaLeft,
+        IpcHorizontalAlignment::Center => H::HaCenter,
+        IpcHorizontalAlignment::Right => H::HaRight,
+    }) as i32
+}
+
+fn vertical_alignment_value(alignment: IpcVerticalAlignment) -> i32 {
+    use common::VerticalAlignment as V;
+    (match alignment {
+        IpcVerticalAlignment::Top => V::VaTop,
+        IpcVerticalAlignment::Center => V::VaCenter,
+        IpcVerticalAlignment::Bottom => V::VaBottom,
+    }) as i32
+}
+
 /// Describe a text item from KiCad's message, or say which part is missing.
 ///
 /// Every part is required. A missing angle or stroke width is not read as
@@ -210,6 +228,22 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
     if let Some(layer) = &edit.layer {
         text.layer = crate::builders::try_layer_from_name(layer)? as i32;
     }
+    if let Some(knockout) = edit.knockout {
+        text.knockout = knockout;
+    }
+    if let Some(locked) = edit.locked {
+        // Written only when the flag really changes: KiCad may send
+        // `LS_UNKNOWN` for an unlocked item, and replacing that with
+        // `LS_UNLOCKED` would be an edit nobody asked for.
+        let is_locked = text.locked == common::LockedState::LsLocked as i32;
+        if locked != is_locked {
+            text.locked = if locked {
+                common::LockedState::LsLocked
+            } else {
+                common::LockedState::LsUnlocked
+            } as i32;
+        }
+    }
     let body = text
         .text
         .as_mut()
@@ -223,7 +257,14 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
     let needs_attributes = edit.angle_deg.is_some()
         || edit.size_x_nm.is_some()
         || edit.size_y_nm.is_some()
-        || edit.stroke_width_nm.is_some();
+        || edit.stroke_width_nm.is_some()
+        || edit.mirrored.is_some()
+        || edit.horizontal_alignment.is_some()
+        || edit.vertical_alignment.is_some()
+        || edit.bold.is_some()
+        || edit.italic.is_some()
+        || edit.keep_upright.is_some()
+        || edit.font_name.is_some();
     if needs_attributes {
         let attributes = body
             .attributes
@@ -246,6 +287,27 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
         }
         if let Some(value_nm) = edit.stroke_width_nm {
             attributes.stroke_width = Some(common::Distance { value_nm });
+        }
+        if let Some(mirrored) = edit.mirrored {
+            attributes.mirrored = mirrored;
+        }
+        if let Some(alignment) = edit.horizontal_alignment {
+            attributes.horizontal_alignment = horizontal_alignment_value(alignment);
+        }
+        if let Some(alignment) = edit.vertical_alignment {
+            attributes.vertical_alignment = vertical_alignment_value(alignment);
+        }
+        if let Some(bold) = edit.bold {
+            attributes.bold = bold;
+        }
+        if let Some(italic) = edit.italic {
+            attributes.italic = italic;
+        }
+        if let Some(keep_upright) = edit.keep_upright {
+            attributes.keep_upright = keep_upright;
+        }
+        if let Some(font_name) = &edit.font_name {
+            attributes.font_name = font_name.clone();
         }
     }
     Ok(())
@@ -979,6 +1041,123 @@ mod tests {
             &mut text,
             &IpcTextEdit {
                 angle_deg: Some(90.0),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("synthesise"), "{error:#}");
+    }
+
+    /// Each style attribute reaches the one proto field that carries it and
+    /// shows up in the state a readback compares, so a KiCad that drops it
+    /// cannot pass for success (#202).
+    #[test]
+    fn each_style_attribute_changes_exactly_its_own_property() {
+        let original = sample();
+        let before = text_state(&original).unwrap();
+        let cases: [(IpcTextEdit, &str); 9] = [
+            (
+                IpcTextEdit {
+                    mirrored: Some(true),
+                    ..Default::default()
+                },
+                "t.mirrored: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    horizontal_alignment: Some(IpcHorizontalAlignment::Right),
+                    ..Default::default()
+                },
+                "t.horizontal_alignment: expected \"center\", observed \"right\"",
+            ),
+            (
+                IpcTextEdit {
+                    vertical_alignment: Some(IpcVerticalAlignment::Top),
+                    ..Default::default()
+                },
+                "t.vertical_alignment: expected \"center\", observed \"top\"",
+            ),
+            (
+                IpcTextEdit {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+                "t.bold: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    italic: Some(true),
+                    ..Default::default()
+                },
+                "t.italic: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    keep_upright: Some(true),
+                    ..Default::default()
+                },
+                "t.keep_upright: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    knockout: Some(true),
+                    ..Default::default()
+                },
+                "t.knockout: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    locked: Some(true),
+                    ..Default::default()
+                },
+                "t.locked: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    font_name: Some(String::new()),
+                    ..Default::default()
+                },
+                "t.font_name: expected \"Osifont\", observed \"\"",
+            ),
+        ];
+        for (edit, expected) in cases {
+            let mut edited = original.clone();
+            apply_text_edit(&mut edited, &edit).unwrap();
+            assert_eq!(
+                text_state_mismatches("t", &before, &text_state(&edited).unwrap()),
+                vec![expected.to_string()],
+                "{edit:?}"
+            );
+        }
+    }
+
+    /// KiCad may report an unlocked item as `LS_UNKNOWN`. Asking for the
+    /// state it already has must not rewrite the message, or the edit would
+    /// send an update for a change nobody can observe.
+    #[test]
+    fn restating_the_lock_state_leaves_the_message_alone() {
+        let mut text = sample();
+        text.locked = common::LockedState::LsUnknown as i32;
+        let original = text.clone();
+        apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                locked: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn a_style_attribute_is_never_set_on_synthesised_attributes() {
+        let mut text = sample();
+        text.text.as_mut().unwrap().attributes = None;
+        let error = apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                mirrored: Some(true),
                 ..Default::default()
             },
         )
