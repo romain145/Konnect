@@ -359,6 +359,14 @@ set_footprint_metadata(
   renumber one or every matching direct-child pad atomically.
 - Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
   override how zones connect to one pad, or `inherited` to remove the override.
+- Use `edit_footprint_pad` with `fabrication_property` (or the same key on a
+  `create_footprint` pad) to set KiCad's pad fabrication property: `castellated`,
+  `heatsink`, `testpoint`, `bga`, `fiducial_glob`, `fiducial_loc`, `mechanical`,
+  `pressfit`, or `none` to remove it. Castellated edge pads need it: without it
+  KiCad's DRC reports `copper_edge_clearance` for every pad on the board edge.
+  `get_footprint_info` with `include_pads` reads it back. The property lives in
+  the library footprint; a footprint placed on a board through KiCad 10's API
+  does not carry it (see `dropped_pad_properties` on `update_pcb_from_schematic`).
 
 ### Existing Footprint 3D Models
 

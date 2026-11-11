@@ -60,6 +60,16 @@ below, which is the pad each one is on:
 | 7 | `PAD_PROP_MECHANICAL` | `pad_prop_mechanical` | `mechanical` |
 | 8 | `PAD_PROP_PRESSFIT` | `pad_prop_pressfit` | `pressfit` |
 
+## An SMD pad (#195)
+
+Written the same way from `Resistor_SMD.pretty/R_0603_1608Metric`, whose two
+`smd roundrect` pads have no drill, to show where the clause goes without one.
+
+| Fixture | Change made in KiCad | SHA-256 (first 16) |
+|---|---|---|
+| `pad_property_smd_none_kicad10.kicad_mod` | none (load and save) | `33eb180463ba5d08` |
+| `pad_property_smd_heatsink_kicad10.kicad_mod` | pad 1 set to `PAD_PROP_HEATSINK` | `5f6c702bdc263a00` |
+
 ## What they show
 
 - KiCad writes the property as one bare atom, `(property pad_prop_heatsink)`,

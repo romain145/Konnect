@@ -11,9 +11,19 @@
 //! (`pad_prop_heatsink`). The tokens are the ones KiCad 10.0.8 writes for each
 //! `PAD_PROP` value; `tests/fixtures/pad_property_kicad10.README.md` has the
 //! files that show it.
+//!
+//! Two kinds of tool use it. `update_pcb_from_schematic` reads a library
+//! footprint's pads to say which properties a board placed through KiCad 10's
+//! API does not get (#193). `edit_footprint_pad` and `create_footprint` write
+//! the clause into a footprint file, where nothing stands in the way (#195).
 
+use konnect_sexp::parser::parse_sexp;
+use konnect_sexp::writer::{apply_edits, find_direct_child_blocks, SexpEdit};
 use konnect_sexp::SexpNode;
 use serde::Serialize;
+
+/// What a tool argument and a response say for a pad with no property.
+pub(crate) const NONE: &str = "none";
 
 /// KiCad's `PAD_PROP` values other than `NONE`, which a footprint file states
 /// by having no `(property …)` clause in the pad.
@@ -70,6 +80,12 @@ impl PadFabricationProperty {
         }
     }
 
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|property| property.name() == name)
+    }
+
     pub(crate) fn from_token(token: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -85,6 +101,126 @@ pub(crate) fn reported_name(token: &str) -> &str {
         Some(property) => property.name(),
         None => token,
     }
+}
+
+/// Every value a `fabrication_property` argument takes: `none`, then KiCad's
+/// eight in its own order. Tool schemas take their `enum` from here.
+pub(crate) fn argument_names() -> Vec<&'static str> {
+    std::iter::once(NONE)
+        .chain(
+            PadFabricationProperty::ALL
+                .into_iter()
+                .map(PadFabricationProperty::name),
+        )
+        .collect()
+}
+
+/// A `fabrication_property` argument: `Some(None)` for `none`, which removes
+/// the clause, `Some(Some(_))` for a property, and `None` for a name that is
+/// neither.
+pub(crate) fn parse_argument(name: &str) -> Option<Option<PadFabricationProperty>> {
+    if name == NONE {
+        Some(None)
+    } else {
+        PadFabricationProperty::from_name(name).map(Some)
+    }
+}
+
+/// Why a `fabrication_property` argument was refused, for the caller.
+pub(crate) fn unsupported_argument_reason(name: &str) -> String {
+    format!(
+        "unsupported fabrication property '{name}'; expected one of {}",
+        argument_names().join(", ")
+    )
+}
+
+/// Direct `(property …)` children of one `(pad …)` block.
+fn property_children(pad_block: &str) -> Vec<(usize, usize)> {
+    find_direct_child_blocks(pad_block, "pad")
+        .into_iter()
+        .filter(|&(start, end)| {
+            parse_sexp(&pad_block[start..end]).is_ok_and(|child| child.head() == Some("property"))
+        })
+        .collect()
+}
+
+/// The fabrication property one `(pad …)` block carries, as a response names
+/// it: `none` when the pad has no clause.
+pub(crate) fn name_in_pad_block(pad_block: &str) -> String {
+    property_children(pad_block)
+        .first()
+        .and_then(|&(start, end)| parse_sexp(&pad_block[start..end]).ok())
+        .and_then(|child| {
+            child
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .map(|token| reported_name(token).to_string())
+        })
+        .unwrap_or_else(|| NONE.to_string())
+}
+
+/// Whitespace immediately before `index`, so a clause can be added or removed
+/// with the indentation and line endings its siblings already use.
+fn leading_whitespace_start(source: &str, index: usize) -> usize {
+    source[..index]
+        .trim_end_matches(|c: char| c.is_ascii_whitespace())
+        .len()
+}
+
+/// Children KiCad writes before `property` inside a pad. A new clause goes
+/// after the last of these, which is where KiCad itself writes it: after the
+/// size and the drill, before the layers.
+const PAD_CHILDREN_BEFORE_PROPERTY: &[&str] = &["at", "locked", "size", "rect_delta", "drill"];
+
+/// One `(pad …)` block with its fabrication property set, or removed for
+/// `None`. Everything else in the block is left byte for byte.
+pub(crate) fn set_in_pad_block(
+    pad_block: String,
+    property: Option<PadFabricationProperty>,
+) -> String {
+    let existing = property_children(&pad_block);
+    let mut edits = Vec::new();
+    // A pad has one property. Whatever is asked, a second clause goes.
+    let delete = |edits: &mut Vec<SexpEdit>, clauses: &[(usize, usize)]| {
+        for &(start, end) in clauses {
+            edits.push(SexpEdit::delete(
+                leading_whitespace_start(&pad_block, start),
+                end,
+            ));
+        }
+    };
+    match (property, existing.split_first()) {
+        (Some(property), Some((&(start, end), duplicates))) => {
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("(property {})", property.token()),
+            ));
+            delete(&mut edits, duplicates);
+        }
+        (Some(property), None) => {
+            let clause = format!("(property {})", property.token());
+            let children = find_direct_child_blocks(&pad_block, "pad");
+            let after = children.iter().rev().find(|&&(start, end)| {
+                parse_sexp(&pad_block[start..end]).is_ok_and(|child| {
+                    child
+                        .head()
+                        .is_some_and(|head| PAD_CHILDREN_BEFORE_PROPERTY.contains(&head))
+                })
+            });
+            if let Some(&(start, end)) = after {
+                let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
+                edits.push(SexpEdit::insert(end, format!("{separator}{clause}")));
+            } else if let Some(&(start, _)) = children.first() {
+                let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
+                edits.push(SexpEdit::insert(start, format!("{clause}{separator}")));
+            } else if let Some(close) = pad_block.rfind(')') {
+                edits.push(SexpEdit::insert(close, format!(" {clause}")));
+            }
+        }
+        (None, _) => delete(&mut edits, &existing),
+    }
+    apply_edits(pad_block, edits)
 }
 
 /// One pad of a footprint and the fabrication property it carries.
@@ -141,12 +277,73 @@ mod tests {
                 "KiCad's tokens are the names with one prefix"
             );
             assert_eq!(
+                PadFabricationProperty::from_name(property.name()),
+                Some(property)
+            );
+            assert_eq!(
                 PadFabricationProperty::from_token(property.token()),
                 Some(property)
             );
+            assert_eq!(parse_argument(property.name()), Some(Some(property)));
         }
         // `none` is the absence of the clause, not a ninth token.
+        assert_eq!(PadFabricationProperty::from_name("none"), None);
         assert_eq!(PadFabricationProperty::from_token("pad_prop_none"), None);
+        assert_eq!(parse_argument("none"), Some(None));
+        assert_eq!(parse_argument("pad_prop_bga"), None);
+        assert_eq!(
+            argument_names(),
+            [
+                "none",
+                "bga",
+                "fiducial_glob",
+                "fiducial_loc",
+                "testpoint",
+                "heatsink",
+                "castellated",
+                "mechanical",
+                "pressfit"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_line_pad_gets_the_property_after_its_drill() {
+        let pad =
+            r#"(pad "1" thru_hole circle (at 0 0) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))"#;
+        let castellated =
+            set_in_pad_block(pad.to_string(), Some(PadFabricationProperty::Castellated));
+        assert_eq!(
+            castellated,
+            r#"(pad "1" thru_hole circle (at 0 0) (size 2 2) (drill 1) (property pad_prop_castellated) (layers "*.Cu" "*.Mask"))"#
+        );
+        assert_eq!(name_in_pad_block(&castellated), "castellated");
+        assert_eq!(set_in_pad_block(castellated, None), pad);
+        assert_eq!(name_in_pad_block(pad), "none");
+    }
+
+    #[test]
+    fn a_pad_keeps_one_property_however_many_it_had() {
+        let pad = r#"(pad "1" smd rect (at 0 0) (size 2 1) (property pad_prop_bga) (property pad_prop_testpoint) (layers "F.Cu"))"#;
+        assert_eq!(
+            set_in_pad_block(pad.to_string(), Some(PadFabricationProperty::Heatsink)),
+            r#"(pad "1" smd rect (at 0 0) (size 2 1) (property pad_prop_heatsink) (layers "F.Cu"))"#
+        );
+        assert_eq!(
+            set_in_pad_block(pad.to_string(), None),
+            r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu"))"#
+        );
+    }
+
+    /// The clause is placed by the pad's own children, so a quoted pad number
+    /// that looks like one is not mistaken for it.
+    #[test]
+    fn a_pad_number_that_looks_like_a_clause_is_not_an_anchor() {
+        let pad = r#"(pad "(drill 1)" smd rect (layers "F.Cu") (size 2 1) (at 0 0))"#;
+        assert_eq!(
+            set_in_pad_block(pad.to_string(), Some(PadFabricationProperty::Testpoint)),
+            r#"(pad "(drill 1)" smd rect (layers "F.Cu") (size 2 1) (at 0 0) (property pad_prop_testpoint))"#
+        );
     }
 
     /// One pin header saved by KiCad with a different `PAD_PROP` on each of
