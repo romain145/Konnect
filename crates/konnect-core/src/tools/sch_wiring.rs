@@ -332,6 +332,8 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
              Name the pin with reference + pin_number, or give its coordinates directly. \
+             stub_length 0 writes no wire and puts the label on the pin itself, as \
+             batch_connect_to_net does; the response then has no 'wire'. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
              which are one net across all sheets and instances.",
@@ -353,8 +355,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
-                        "description": "Length of the wire stub in mm" },
+                    "stub_length": { "type": "number", "minimum": 0, "default": 2.54,
+                        "description": "Length of the wire stub in mm. 0 writes no wire and \
+                                        places the label on the pin." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -2496,6 +2499,14 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    // The schema says `minimum: 0`, but a direct caller is not held to it. A
+    // negative stub would run back into the symbol body (#186).
+    if stub_length < 0.0 {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be 0 or greater; 0 puts the label on the pin with no wire",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -2564,17 +2575,25 @@ async fn handle_connect_to_net(
 
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
-    })))
+    });
+    // Reported only when written, as batch_connect_to_net does: a zero-length
+    // stub is a label on the pin and no wire (#186).
+    if stub_length > 0.0 {
+        body["wire"] = json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y });
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 /// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
 /// with the junctions it needs, and a net or global label at its end. Returns
 /// the label's position and rotation.
+///
+/// A `stub_length` of 0 draws no wire and puts the label on the pin: a wire
+/// whose two ends are one point connects nothing (#186).
 pub(crate) fn add_net_stub(
     sch: &mut cse::Schematic,
     pins: &[(f64, f64)],
@@ -2585,7 +2604,9 @@ pub(crate) fn add_net_stub(
     net: &str,
 ) -> (f64, f64, f64) {
     let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, pins, pin, end);
+    if stub_length > 0.0 {
+        add_stub_wire(sch, pins, pin, end);
+    }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
 }
@@ -3482,6 +3503,108 @@ mod unit_aware_wiring_tests {
             other => panic!("expected text content, got {other:?}"),
         };
         assert!(text.contains("units 1, 2"), "{text}");
+    }
+
+    /// The response body of a `connect_to_net` call that must succeed.
+    async fn connect_to_net_body(
+        path: &std::path::Path,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut full = json!({ "schematic": path.display().to_string() });
+        for (k, v) in args.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        let result = handle_connect_to_net(&full, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn near(value: &serde_json::Value, expected: f64) -> bool {
+        value.as_f64().is_some_and(|v| (v - expected).abs() < 1e-6)
+    }
+
+    /// #186: `stub_length: 0` used to write a wire from the pin to itself.
+    /// It now writes no wire and puts the label on the pin, as
+    /// `batch_connect_to_net` does, and reports no `wire`.
+    #[tokio::test]
+    async fn a_zero_stub_writes_no_wire_and_labels_the_pin() {
+        let (_d, path) = dual_opamp_schematic();
+        let wires_before = cse::Schematic::load(&path).unwrap().wires.len();
+
+        let body = connect_to_net_body(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN", "stub_length": 0 }),
+        )
+        .await;
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.wires.len(), wires_before, "no wire is written");
+        // Pin 1's tip; a 2.54 mm stub would have put the label at 89.84.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 92.38 77.46 180)"), "{after}");
+        assert!(body.get("wire").is_none(), "no wire was written: {body}");
+        assert!(near(&body["label"]["x"], 92.38), "{body}");
+        assert!(near(&body["label"]["y"], 77.46), "{body}");
+    }
+
+    /// A negative length is refused as `invalid_argument` and writes nothing.
+    #[tokio::test]
+    async fn a_negative_stub_is_refused_and_the_file_is_unchanged() {
+        let (_d, path) = dual_opamp_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_connect_to_net(
+            &json!({ "schematic": path.display().to_string(),
+                     "reference": "U1", "pin_number": "1", "net": "IN",
+                     "stub_length": -2.54 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// A positive length is unchanged: one wire from the pin to the label.
+    #[tokio::test]
+    async fn a_positive_stub_still_writes_its_wire() {
+        let (_d, path) = dual_opamp_schematic();
+        let wires_before = cse::Schematic::load(&path).unwrap().wires.len();
+
+        let body = connect_to_net_body(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN" }),
+        )
+        .await;
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.wires.len(), wires_before + 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 89.84 77.46 180)"), "{after}");
+        assert!(near(&body["wire"]["x1"], 92.38), "{body}");
+        assert!(near(&body["wire"]["x2"], 89.84), "{body}");
+        assert!(near(&body["label"]["x"], 89.84), "{body}");
+    }
+
+    #[test]
+    fn the_schema_refuses_a_negative_stub() {
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "connect_to_net")
+            .unwrap();
+        let args =
+            |stub: f64| json!({ "schematic": "s.kicad_sch", "net": "N", "stub_length": stub });
+        assert!(def.input_validator.is_valid(&args(0.0)));
+        assert!(def.input_validator.is_valid(&args(2.54)));
+        assert!(!def.input_validator.is_valid(&args(-1.0)));
     }
 
     #[tokio::test]
