@@ -84,6 +84,28 @@ fn vertical_alignment_name(value: i32) -> String {
     .to_string()
 }
 
+fn mirrored_for_layer_side(layer: i32) -> Option<bool> {
+    mirrored_for_layer_name(layer_enum_to_name(layer))
+}
+
+fn horizontal_alignment_value(alignment: IpcHorizontalAlignment) -> i32 {
+    use common::HorizontalAlignment as H;
+    (match alignment {
+        IpcHorizontalAlignment::Left => H::HaLeft,
+        IpcHorizontalAlignment::Center => H::HaCenter,
+        IpcHorizontalAlignment::Right => H::HaRight,
+    }) as i32
+}
+
+fn vertical_alignment_value(alignment: IpcVerticalAlignment) -> i32 {
+    use common::VerticalAlignment as V;
+    (match alignment {
+        IpcVerticalAlignment::Top => V::VaTop,
+        IpcVerticalAlignment::Center => V::VaCenter,
+        IpcVerticalAlignment::Bottom => V::VaBottom,
+    }) as i32
+}
+
 /// Describe a text item from KiCad's message, or say which part is missing.
 ///
 /// Every part is required. A missing angle or stroke width is not read as
@@ -210,6 +232,33 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
     if let Some(layer) = &edit.layer {
         text.layer = crate::builders::try_layer_from_name(layer)? as i32;
     }
+    anyhow::ensure!(
+        !(edit.mirror_to_match_layer && edit.mirrored.is_some()),
+        "mirroring to match the layer and an explicit mirrored flag are two answers to one \
+         question"
+    );
+    // Resolved after the layer change, against the layer the text ends on.
+    let mirrored = match edit.mirrored {
+        Some(mirrored) => Some(mirrored),
+        None if edit.mirror_to_match_layer => mirrored_for_layer_side(text.layer),
+        None => None,
+    };
+    if let Some(knockout) = edit.knockout {
+        text.knockout = knockout;
+    }
+    if let Some(locked) = edit.locked {
+        // Written only when the flag really changes: KiCad may send
+        // `LS_UNKNOWN` for an unlocked item, and replacing that with
+        // `LS_UNLOCKED` would be an edit nobody asked for.
+        let is_locked = text.locked == common::LockedState::LsLocked as i32;
+        if locked != is_locked {
+            text.locked = if locked {
+                common::LockedState::LsLocked
+            } else {
+                common::LockedState::LsUnlocked
+            } as i32;
+        }
+    }
     let body = text
         .text
         .as_mut()
@@ -223,7 +272,14 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
     let needs_attributes = edit.angle_deg.is_some()
         || edit.size_x_nm.is_some()
         || edit.size_y_nm.is_some()
-        || edit.stroke_width_nm.is_some();
+        || edit.stroke_width_nm.is_some()
+        || mirrored.is_some()
+        || edit.horizontal_alignment.is_some()
+        || edit.vertical_alignment.is_some()
+        || edit.bold.is_some()
+        || edit.italic.is_some()
+        || edit.keep_upright.is_some()
+        || edit.font_name.is_some();
     if needs_attributes {
         let attributes = body
             .attributes
@@ -246,6 +302,27 @@ fn apply_text_edit(text: &mut board::BoardText, edit: &IpcTextEdit) -> Result<()
         }
         if let Some(value_nm) = edit.stroke_width_nm {
             attributes.stroke_width = Some(common::Distance { value_nm });
+        }
+        if let Some(mirrored) = mirrored {
+            attributes.mirrored = mirrored;
+        }
+        if let Some(alignment) = edit.horizontal_alignment {
+            attributes.horizontal_alignment = horizontal_alignment_value(alignment);
+        }
+        if let Some(alignment) = edit.vertical_alignment {
+            attributes.vertical_alignment = vertical_alignment_value(alignment);
+        }
+        if let Some(bold) = edit.bold {
+            attributes.bold = bold;
+        }
+        if let Some(italic) = edit.italic {
+            attributes.italic = italic;
+        }
+        if let Some(keep_upright) = edit.keep_upright {
+            attributes.keep_upright = keep_upright;
+        }
+        if let Some(font_name) = &edit.font_name {
+            attributes.font_name = font_name.clone();
         }
     }
     Ok(())
@@ -827,6 +904,204 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Apply one edit to the same fields of many placed footprints, in one
+    /// KiCad undo step.
+    ///
+    /// `references` names the footprints; `None` covers every footprint on
+    /// the board. A named reference must identify exactly one footprint and
+    /// carry every field in `slots`, readable, or nothing is sent. On a
+    /// whole-board run a footprint without such a field is reported in
+    /// `skipped` instead, so one odd footprint does not block the rest.
+    ///
+    /// Each footprint is sent back whole, as [`Self::edit_footprint_field_in`]
+    /// sends it, and only footprints the edit really changes are sent.
+    /// Success requires a fresh read in which every one of them holds the
+    /// requested values with its pose and other mandatory fields unchanged.
+    /// This method never saves the board.
+    pub fn edit_footprint_fields_in(
+        &self,
+        document: common::DocumentSpecifier,
+        references: Option<&[String]>,
+        slots: &[IpcFootprintFieldSlot],
+        edit: &IpcTextEdit,
+    ) -> Result<IpcFootprintFieldBatchOutcome> {
+        anyhow::ensure!(!edit.is_empty(), "the edit names no property to change");
+        anyhow::ensure!(!slots.is_empty(), "the edit names no field to change");
+        let placed = self.placed_footprints_in(document.clone())?;
+        let targets: Vec<&board::FootprintInstance> = match references {
+            None => placed.iter().collect(),
+            Some(references) => {
+                let mut targets = Vec::with_capacity(references.len());
+                for reference in references {
+                    let mut matches = placed
+                        .iter()
+                        .filter(|footprint| footprint_reference(footprint) == *reference);
+                    match (matches.next(), matches.count()) {
+                        (Some(footprint), 0) => targets.push(footprint),
+                        (None, _) => {
+                            return Err(FootprintTargetError::Missing {
+                                reference: reference.clone(),
+                            }
+                            .into())
+                        }
+                        (Some(_), more) => {
+                            return Err(FootprintTargetError::Ambiguous {
+                                reference: reference.clone(),
+                                matches: more + 1,
+                            }
+                            .into())
+                        }
+                    }
+                }
+                targets
+            }
+        };
+
+        // (original, edited) for every target, with the slots that were
+        // edited on it.
+        let mut planned: Vec<(
+            &board::FootprintInstance,
+            board::FootprintInstance,
+            Vec<IpcFootprintFieldSlot>,
+        )> = Vec::new();
+        let mut skipped = Vec::new();
+        for footprint in targets {
+            let reference = footprint_reference(footprint);
+            let kiid = footprint_kiid(footprint);
+            let mut edited = footprint.clone();
+            let mut edited_slots = Vec::new();
+            for &slot in slots {
+                let problem = match slot_view(footprint, slot) {
+                    None => Some(TextTargetError::MissingField {
+                        reference: reference.clone(),
+                        field: slot.as_str().to_string(),
+                    }),
+                    Some(view) => {
+                        view.unreadable_reason
+                            .map(|reason| TextTargetError::Unreadable {
+                                target: format!("the {} field of '{reference}'", slot.as_str()),
+                                reason,
+                            })
+                    }
+                };
+                // A footprint without a KIID cannot be found again to prove
+                // the edit, so it is no more editable than an unreadable one.
+                let problem = problem.or_else(|| {
+                    kiid.is_empty().then(|| TextTargetError::Unreadable {
+                        target: format!("footprint '{reference}'"),
+                        reason: "KiCad sent no KIID for it".to_string(),
+                    })
+                });
+                if let Some(problem) = problem {
+                    if references.is_some() {
+                        return Err(problem.into());
+                    }
+                    skipped.push(IpcFootprintFieldSkip {
+                        footprint_reference: reference.clone(),
+                        footprint_kiid: kiid.clone(),
+                        slot: slot.as_str().to_string(),
+                        reason: problem.to_string(),
+                    });
+                    continue;
+                }
+                let field = slot_field_mut(&mut edited, slot)
+                    .context("the selected field vanished from its own copy")?;
+                apply_field_edit(field, edit)?;
+                edited_slots.push(slot);
+            }
+            if !edited_slots.is_empty() {
+                planned.push((footprint, edited, edited_slots));
+            }
+        }
+
+        fn views(
+            footprint: &board::FootprintInstance,
+            slots: &[IpcFootprintFieldSlot],
+        ) -> Vec<IpcFootprintField> {
+            slots
+                .iter()
+                .filter_map(|&slot| slot_view(footprint, slot))
+                .collect()
+        }
+        let to_send: Vec<prost_types::Any> = planned
+            .iter()
+            .filter(|(original, edited, _)| !footprint_mismatches(original, edited).is_empty())
+            .map(|(_, edited, _)| crate::builders::pack_any(edited, FOOTPRINT_INSTANCE))
+            .collect();
+        if to_send.is_empty() {
+            let fields = planned
+                .iter()
+                .flat_map(|(original, _, slots)| views(original, slots))
+                .map(|view| IpcFootprintFieldChange {
+                    before: view.clone(),
+                    after: view,
+                })
+                .collect();
+            return Ok(IpcFootprintFieldBatchOutcome::Settled {
+                fields,
+                skipped,
+                sent: false,
+            });
+        }
+
+        let mutation = self.run_commit("Set footprint field style", |client| {
+            client.update_items_in(document.clone(), to_send)
+        });
+        let readback = self.placed_footprints_in(document);
+        let mut fields = Vec::new();
+        let evidence = readback
+            .as_ref()
+            .map(|after| {
+                let mut to_expected = Vec::new();
+                let mut to_before = Vec::new();
+                for (original, edited, slots) in &planned {
+                    let kiid = footprint_kiid(original);
+                    let reference = footprint_reference(original);
+                    let mut matches = after
+                        .iter()
+                        .filter(|footprint| footprint_kiid(footprint) == kiid);
+                    let (Some(observed), 0) = (matches.next(), matches.count()) else {
+                        let gone = format!("{reference}: not exactly one footprint has its KIID");
+                        to_expected.push(gone.clone());
+                        to_before.push(gone);
+                        continue;
+                    };
+                    let prefixed = |mismatches: Vec<String>| {
+                        mismatches
+                            .into_iter()
+                            .map(|mismatch| format!("{reference}: {mismatch}"))
+                            .collect::<Vec<_>>()
+                    };
+                    to_expected.extend(prefixed(footprint_mismatches(edited, observed)));
+                    to_before.extend(prefixed(footprint_mismatches(original, observed)));
+                    fields.extend(
+                        views(original, slots)
+                            .into_iter()
+                            .zip(views(observed, slots))
+                            .map(|(before, after)| IpcFootprintFieldChange { before, after }),
+                    );
+                }
+                (to_expected, to_before)
+            })
+            .map_err(|error| format!("{error:#}"));
+        Ok(match settle(mutation, evidence) {
+            Settled::Applied => IpcFootprintFieldBatchOutcome::Settled {
+                fields,
+                skipped,
+                sent: true,
+            },
+            Settled::Refused(error) => {
+                return Err(error.context(
+                    "KiCad rejected the field style edit; a fresh read confirmed the footprints \
+                     are unchanged",
+                ))
+            }
+            Settled::Uncertain { mismatches, reason } => {
+                IpcFootprintFieldBatchOutcome::Uncertain { mismatches, reason }
+            }
+        })
+    }
+
     /// Edit one board-level text item in place, by KIID.
     ///
     /// `preflight` sees the item exactly as KiCad sent it and may refuse
@@ -979,6 +1254,185 @@ mod tests {
             &mut text,
             &IpcTextEdit {
                 angle_deg: Some(90.0),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("synthesise"), "{error:#}");
+    }
+
+    /// Each style attribute reaches the one proto field that carries it and
+    /// shows up in the state a readback compares, so a KiCad that drops it
+    /// cannot pass for success (#202).
+    #[test]
+    fn each_style_attribute_changes_exactly_its_own_property() {
+        let original = sample();
+        let before = text_state(&original).unwrap();
+        let cases: [(IpcTextEdit, &str); 9] = [
+            (
+                IpcTextEdit {
+                    mirrored: Some(true),
+                    ..Default::default()
+                },
+                "t.mirrored: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    horizontal_alignment: Some(IpcHorizontalAlignment::Right),
+                    ..Default::default()
+                },
+                "t.horizontal_alignment: expected \"center\", observed \"right\"",
+            ),
+            (
+                IpcTextEdit {
+                    vertical_alignment: Some(IpcVerticalAlignment::Top),
+                    ..Default::default()
+                },
+                "t.vertical_alignment: expected \"center\", observed \"top\"",
+            ),
+            (
+                IpcTextEdit {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+                "t.bold: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    italic: Some(true),
+                    ..Default::default()
+                },
+                "t.italic: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    keep_upright: Some(true),
+                    ..Default::default()
+                },
+                "t.keep_upright: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    knockout: Some(true),
+                    ..Default::default()
+                },
+                "t.knockout: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    locked: Some(true),
+                    ..Default::default()
+                },
+                "t.locked: expected false, observed true",
+            ),
+            (
+                IpcTextEdit {
+                    font_name: Some(String::new()),
+                    ..Default::default()
+                },
+                "t.font_name: expected \"Osifont\", observed \"\"",
+            ),
+        ];
+        for (edit, expected) in cases {
+            let mut edited = original.clone();
+            apply_text_edit(&mut edited, &edit).unwrap();
+            assert_eq!(
+                text_state_mismatches("t", &before, &text_state(&edited).unwrap()),
+                vec![expected.to_string()],
+                "{edit:?}"
+            );
+        }
+    }
+
+    /// KiCad may report an unlocked item as `LS_UNKNOWN`. Asking for the
+    /// state it already has must not rewrite the message, or the edit would
+    /// send an update for a change nobody can observe.
+    #[test]
+    fn restating_the_lock_state_leaves_the_message_alone() {
+        let mut text = sample();
+        text.locked = common::LockedState::LsUnknown as i32;
+        let original = text.clone();
+        apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                locked: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(text, original);
+    }
+
+    fn mirrored_after(start: &board::BoardText, layer: Option<&str>) -> bool {
+        let mut text = start.clone();
+        apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                layer: layer.map(str::to_string),
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        text_state(&text).unwrap().mirrored
+    }
+
+    /// Mirroring to match the layer follows the side the text ends on, not
+    /// the flag it started with (#202).
+    #[test]
+    fn mirroring_to_match_the_layer_follows_the_side_the_text_ends_on() {
+        let front = sample();
+        let mut back_unmirrored = sample();
+        back_unmirrored.layer = board::BoardLayer::BlBSilkS as i32;
+        let mut back_mirrored = back_unmirrored.clone();
+        back_mirrored
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .mirrored = true;
+
+        assert!(mirrored_after(&front, Some("B.SilkS")));
+        assert!(mirrored_after(&front, Some("B.Fab")));
+        assert!(!mirrored_after(&back_mirrored, Some("F.SilkS")));
+        assert!(!mirrored_after(&front, Some("F.Fab")));
+        // With no layer named, the layer KiCad holds decides: this is the
+        // text that was moved to the back before anything could mirror it.
+        assert!(mirrored_after(&back_unmirrored, None));
+        assert!(mirrored_after(&back_mirrored, None));
+        assert!(!mirrored_after(&front, None));
+        // A layer with no side leaves the flag as it was, either way.
+        for sideless in ["Edge.Cuts", "In1.Cu", "Dwgs.User"] {
+            assert!(!mirrored_after(&front, Some(sideless)), "{sideless}");
+            assert!(mirrored_after(&back_mirrored, Some(sideless)), "{sideless}");
+        }
+    }
+
+    #[test]
+    fn mirroring_to_match_the_layer_refuses_an_explicit_flag_as_well() {
+        let mut text = sample();
+        let error = apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                mirrored: Some(false),
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("two answers"), "{error:#}");
+    }
+
+    #[test]
+    fn a_style_attribute_is_never_set_on_synthesised_attributes() {
+        let mut text = sample();
+        text.text.as_mut().unwrap().attributes = None;
+        let error = apply_text_edit(
+            &mut text,
+            &IpcTextEdit {
+                mirrored: Some(true),
                 ..Default::default()
             },
         )

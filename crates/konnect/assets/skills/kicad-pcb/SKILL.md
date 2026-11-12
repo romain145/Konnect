@@ -102,8 +102,14 @@ Follow this sequence for a clean PCB workflow:
    footprint names that footprint and every part that needs it: when the footprint
    cannot be placed (custom-shape pads are not supported), assign those parts a
    footprint without them; when the schematic connects a pad the footprint does not
-   have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   have, fix the symbol or the footprint choice. A
+   `pad_fabrication_property_dropped` diagnostic is a warning on a `ready` plan,
+   not a conflict: KiCad 10's API cannot carry a pad's fabrication property
+   (heatsink, BGA, mechanical, castellated, ...), so each footprint listed under
+   `dropped_pad_properties` is placed without it. Tell the user, and have them run
+   KiCad **Tools → Update Footprints from Library** on those parts after the
+   apply; until then DRC reports `lib_footprint_mismatch` for them. A successful
+   apply is one KiCad undo entry, so Ctrl-Z reverses the whole update.
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:

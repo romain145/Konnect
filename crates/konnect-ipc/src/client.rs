@@ -4033,7 +4033,34 @@ impl KiCadIpcClient {
             })?;
         }
 
-        let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
+        // A footprint with no library behind it (inline geometry) has no
+        // field style to copy. Its fields then sit on the silkscreen of the
+        // footprint's side with only the Reference shown, drawn with KiCad's
+        // defaults for footprint text.
+        let silk = if layer == "B.Cu" {
+            "B.SilkS"
+        } else {
+            "F.SilkS"
+        };
+        let reference_style = fields
+            .reference_style
+            .clone()
+            .unwrap_or_else(|| crate::types::IpcFieldStyle::kicad_default(silk, true));
+        let value_style = fields
+            .value_style
+            .clone()
+            .unwrap_or_else(|| crate::types::IpcFieldStyle::kicad_default(silk, false));
+        // Same refusal as the pads and graphics above, for the same crash.
+        for (name, style) in [("Reference", &reference_style), ("Value", &value_style)] {
+            crate::builders::try_layer_from_name(&style.layer).with_context(|| {
+                format!("footprint '{lib_id}' has a {name} field this build cannot place")
+            })?;
+        }
+
+        let text_field = |name: &str,
+                          text: &str,
+                          local: (f64, f64, f64),
+                          style: &crate::types::IpcFieldStyle| {
             // Field text positions come footprint-local from the library and
             // are transformed exactly like pads, so the placed part keeps the
             // library's text layout instead of a synthesized offset that can
@@ -4047,39 +4074,58 @@ impl KiCadIpcClient {
                     id: None,
                     text: Some(kiapi::common::types::Text {
                         position: Some(crate::builders::vec2(bx, by)),
+                        // Every member is stated. A member left at the
+                        // protobuf default is not "KiCad's default": KiCad
+                        // saved `keep_upright: false` as `(unlocked yes)`, a
+                        // zero `line_spacing` as `(line_spacing 0)` and a
+                        // missing `stroke_width` as no thickness (#201).
                         attributes: Some(kiapi::common::types::TextAttributes {
-                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            font_name: style.font_face.clone(),
+                            horizontal_alignment: style.horizontal_alignment as i32,
+                            vertical_alignment: style.vertical_alignment as i32,
                             angle: Some(kiapi::common::types::Angle {
                                 value_degrees: readable_text_angle(rotation + frot),
                             }),
-                            ..Default::default()
+                            line_spacing: style.line_spacing,
+                            // Absent stays absent: a library field with no
+                            // `(thickness …)` has none on the board either.
+                            stroke_width: style.thickness_mm.map(crate::builders::distance),
+                            italic: style.italic,
+                            bold: style.bold,
+                            underlined: false,
+                            // `visible` (deprecated since KiCad 9.0.1, when
+                            // visibility moved to `Field.visible` below) and
+                            // `multiline` are not in the file. Both are what
+                            // KiCad 10 reports for a footprint field it read
+                            // from one (`issue_474_r1.ipc.bin`).
+                            visible: true,
+                            mirrored: style.mirrored,
+                            multiline: true,
+                            keep_upright: style.keep_upright,
+                            size: Some(crate::builders::vec2(style.size.0, style.size.1)),
                         }),
                         text: text.to_string(),
                         hyperlink: String::new(),
                     }),
-                    layer: crate::builders::layer_from_name(if layer == "B.Cu" {
-                        "B.SilkS"
-                    } else {
-                        "F.SilkS"
-                    }) as i32,
+                    layer: crate::builders::layer_from_name(&style.layer) as i32,
                     knockout: false,
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     parent: None,
                 }),
-                visible,
+                visible: style.visible,
             }
         };
         let reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
-            true,
+            &reference_style,
         );
         let value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
-            false,
+            &value_style,
         );
         let mut child_items: Vec<prost_types::Any> = pads
             .iter()
@@ -4713,11 +4759,15 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
         } => {
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
             builders::pack_any(
-                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+                &builders::with_stroke_style(
+                    builders::board_segment(layer, *width, x1, y1, x2, y2),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4726,6 +4776,7 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
             filled,
         } => {
             if is_cardinal_rotation(rotation) {
@@ -4734,14 +4785,17 @@ fn build_graphic_child(
                 let (x1, y1) = xf(*start);
                 let (x2, y2) = xf(*end);
                 builders::pack_any(
-                    &builders::board_rectangle(
-                        layer,
-                        *width,
-                        x1.min(x2),
-                        y1.min(y2),
-                        x1.max(x2),
-                        y1.max(y2),
-                        *filled,
+                    &builders::with_stroke_style(
+                        builders::board_rectangle(
+                            layer,
+                            *width,
+                            x1.min(x2),
+                            y1.min(y2),
+                            x1.max(x2),
+                            y1.max(y2),
+                            *filled,
+                        ),
+                        *style,
                     ),
                     SHAPE,
                 )
@@ -4756,7 +4810,10 @@ fn build_graphic_child(
                     xf((start.0, end.1)),
                 ];
                 builders::pack_any(
-                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                    &builders::with_stroke_style(
+                        builders::board_polygon(layer, *width, *filled, &[corners]),
+                        *style,
+                    ),
                     SHAPE,
                 )
             }
@@ -4766,6 +4823,7 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
             filled,
         } => {
             let (cx, cy) = xf(*center);
@@ -4773,7 +4831,10 @@ fn build_graphic_child(
             // circumference-point encoding by re-deriving it from the length.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                &builders::with_stroke_style(
+                    builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4783,12 +4844,16 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            style,
         } => {
             let (sx, sy) = xf(*start);
             let (mx, my) = xf(*mid);
             let (ex, ey) = xf(*end);
             builders::pack_any(
-                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                &builders::with_stroke_style(
+                    builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -4796,11 +4861,15 @@ fn build_graphic_child(
             points,
             layer,
             width,
+            style,
             filled,
         } => {
             let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
             builders::pack_any(
-                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+                &builders::with_stroke_style(
+                    builders::board_polygon(layer, *width, *filled, &[transformed]),
+                    *style,
+                ),
                 SHAPE,
             )
         }
@@ -6179,6 +6248,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 2.0),
                 layer: "F.CrtYd".to_string(),
                 width: 0.05,
+                style: Default::default(),
                 filled: false,
             },
             IpcGraphicDefinition::Line {
@@ -6186,6 +6256,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "F.SilkS".to_string(),
                 width: 0.12,
+                style: Default::default(),
             },
             IpcGraphicDefinition::Text {
                 text: "hello".to_string(),
@@ -6248,6 +6319,189 @@ mod footprint_graphics_tests {
         );
     }
 
+    /// #201: a footprint with no library behind it (inline geometry) still
+    /// gets fields KiCad saves cleanly. Left at the protobuf defaults they
+    /// were saved as `(unlocked yes)`, no thickness and `(line_spacing 0)`.
+    #[test]
+    fn fields_without_a_library_style_use_kicads_defaults_not_protobufs() {
+        let fp = build(&[], 100.0, 50.0, 0.0);
+
+        for (field, visible) in [(&fp.reference_field, true), (&fp.value_field, false)] {
+            let field = field.as_ref().unwrap();
+            assert_eq!(field.visible, visible, "{}", field.name);
+            let text = field.text.as_ref().unwrap();
+            assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
+            let attributes = text.text.as_ref().unwrap().attributes.as_ref().unwrap();
+            assert!(attributes.keep_upright, "{}", field.name);
+            assert_eq!(attributes.line_spacing, 1.0, "{}", field.name);
+            assert_eq!(attributes.stroke_width.unwrap().value_nm, 150_000);
+            assert_eq!(attributes.size.unwrap().x_nm, 1_000_000);
+            assert_eq!(attributes.size.unwrap().y_nm, 1_000_000);
+        }
+    }
+
+    /// #201: a field the library describes is built as described, on the
+    /// library's layer, and a field with no thickness is sent without one.
+    #[test]
+    fn a_library_field_style_is_sent_as_given() {
+        use crate::types::{IpcFieldPlacement, IpcFieldStyle};
+        use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+        let style = IpcFieldStyle {
+            layer: "F.Fab".to_string(),
+            visible: true,
+            size: (0.8, 1.2),
+            thickness_mm: None,
+            line_spacing: 1.5,
+            font_face: "Arial".to_string(),
+            bold: true,
+            italic: true,
+            horizontal_alignment: HorizontalAlignment::HaLeft,
+            vertical_alignment: VerticalAlignment::VaTop,
+            mirrored: true,
+            keep_upright: false,
+        };
+        let any = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            &[],
+            &IpcFieldPlacement {
+                value_style: Some(style),
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+
+        let value = fp.value_field.unwrap();
+        assert!(value.visible);
+        let text = value.text.unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let attributes = text.text.unwrap().attributes.unwrap();
+        assert_eq!(attributes.size.unwrap().x_nm, 800_000);
+        assert_eq!(attributes.size.unwrap().y_nm, 1_200_000);
+        assert_eq!(attributes.stroke_width, None);
+        assert_eq!(attributes.line_spacing, 1.5);
+        assert_eq!(attributes.font_name, "Arial");
+        assert!(attributes.bold && attributes.italic && attributes.mirrored);
+        assert_eq!(
+            attributes.horizontal_alignment(),
+            HorizontalAlignment::HaLeft
+        );
+        assert_eq!(attributes.vertical_alignment(), VerticalAlignment::VaTop);
+        assert!(!attributes.keep_upright);
+        // The definition carries the same field as the instance.
+        assert_eq!(
+            fp.definition
+                .unwrap()
+                .value_field
+                .unwrap()
+                .text
+                .unwrap()
+                .layer,
+            kiapi::board::types::BoardLayer::BlFFab as i32
+        );
+
+        let unknown = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            &[],
+            &IpcFieldPlacement {
+                reference_style: Some(IpcFieldStyle::kicad_default("F.Silk", true)),
+                ..Default::default()
+            },
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap_err();
+        assert!(format!("{unknown:#}").contains("Reference"), "{unknown:#}");
+    }
+
+    /// #200: every shape kind carries the line style it was given, and none
+    /// goes out as `SLS_UNKNOWN`, which KiCad stores as `default` whatever the
+    /// library said. Checked at a rotation that turns the rectangle into a
+    /// polygon too, since that arm builds a different message.
+    #[test]
+    fn each_shape_is_sent_with_its_own_stroke_style() {
+        use crate::types::IpcStrokeStyle;
+        use kiapi::common::types::StrokeLineStyle;
+
+        let layer = || "F.SilkS".to_string();
+        let graphics = |style: IpcStrokeStyle| {
+            vec![
+                IpcGraphicDefinition::Line {
+                    start: (-1.0, 0.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                },
+                IpcGraphicDefinition::Rect {
+                    start: (-1.0, -2.0),
+                    end: (1.0, 2.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+                IpcGraphicDefinition::Circle {
+                    center: (0.0, 0.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+                IpcGraphicDefinition::Arc {
+                    start: (-1.0, 0.0),
+                    mid: (0.0, 1.0),
+                    end: (1.0, 0.0),
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                },
+                IpcGraphicDefinition::Poly {
+                    points: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                    layer: layer(),
+                    width: 0.12,
+                    style,
+                    filled: false,
+                },
+            ]
+        };
+        for (style, expected) in [
+            (IpcStrokeStyle::Solid, StrokeLineStyle::SlsSolid),
+            (IpcStrokeStyle::Default, StrokeLineStyle::SlsDefault),
+            (IpcStrokeStyle::Dash, StrokeLineStyle::SlsDash),
+        ] {
+            for rotation in [0.0, 37.0] {
+                let sent: Vec<_> = shapes(&build(&graphics(style), 100.0, 50.0, rotation))
+                    .iter()
+                    .map(|shape| {
+                        shape
+                            .shape
+                            .as_ref()
+                            .and_then(|shape| shape.attributes.as_ref())
+                            .and_then(|attributes| attributes.stroke.as_ref())
+                            .expect("a stroke")
+                            .style()
+                    })
+                    .collect();
+                assert_eq!(sent, vec![expected; 5], "{style:?} at {rotation}");
+            }
+        }
+    }
+
     /// At 180° the text would read upside down; KiCAD keeps labels readable by
     /// flipping such angles 180°, and so does the emitted child.
     #[test]
@@ -6287,6 +6541,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "F.CrtYd".to_string(),
             width: 0.05,
+            style: Default::default(),
             filled: false,
         }];
         let fp = build(&graphics, 0.0, 0.0, 45.0);
@@ -6318,6 +6573,7 @@ mod footprint_graphics_tests {
             end: (1.5, 0.0),
             layer: "F.Fab".to_string(),
             width: 0.1,
+            style: Default::default(),
             filled: true,
         }];
         let fp = build(&graphics, 10.0, 10.0, 90.0);
@@ -6403,6 +6659,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "Dwgs.User".to_string(),
                 width: 0.1,
+                style: Default::default(),
             },
             IpcGraphicDefinition::Text {
                 text: "PCB Edge".to_string(),
@@ -6481,6 +6738,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "In99.Cu".to_string(),
             width: 0.1,
+            style: Default::default(),
         }];
         let error = format!(
             "{:#}",

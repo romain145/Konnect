@@ -281,6 +281,22 @@ pub struct DrcReport {
     /// category at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schematic_parity_diagnostic: Option<String>,
+    /// The checks this run had switched off (severity `ignore`), as KiCad
+    /// lists them in the report. A check in here cannot appear among the
+    /// findings however often the board breaks it, so "no violations" has to
+    /// be read beside this list (#203). `None` when the report carries no
+    /// such list, which is not the same as "nothing is ignored".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_checks: Option<Vec<IgnoredCheck>>,
+}
+
+/// One entry of the report's `ignored_checks`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredCheck {
+    /// KiCad's rule key, the same word a violation carries as `rule` and the
+    /// project file's `rule_severities` uses.
+    pub key: String,
+    pub description: String,
 }
 
 impl DrcReport {
@@ -1182,6 +1198,20 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
         schematic_parity: category(raw, "schematic_parity"),
         ownership_diagnostic: None,
         schematic_parity_diagnostic: None,
+        ignored_checks: raw
+            .get("ignored_checks")
+            .and_then(serde_json::Value::as_array)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .filter_map(|check| {
+                        Some(IgnoredCheck {
+                            key: check["key"].as_str()?.to_string(),
+                            description: check["description"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            }),
     })
 }
 

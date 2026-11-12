@@ -777,6 +777,7 @@ fn place_footprint_sends_graphics_children() {
             end: (0.8, 0.7),
             layer: "F.CrtYd".to_string(),
             width: 0.05,
+            style: Default::default(),
             filled: false,
         },
         IpcGraphicDefinition::Line {
@@ -784,6 +785,7 @@ fn place_footprint_sends_graphics_children() {
             end: (0.6, -0.5),
             layer: "F.SilkS".to_string(),
             width: 0.12,
+            style: Default::default(),
         },
         IpcGraphicDefinition::Text {
             text: "R_0402".to_string(),
@@ -1625,6 +1627,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
             layer: "F.SilkS".to_string(),
             width: 0.12,
+            style: Default::default(),
             filled: false,
         }],
         &konnect_ipc::IpcFieldPlacement::default(),
@@ -3199,7 +3202,27 @@ struct TextBoard {
     ignore_updates: bool,
     reject_updates: bool,
     drop_font_on_update: bool,
+    /// Play a KiCad whose `UpdateItems` accepts a text but keeps the mirror
+    /// flag and both alignments it already held. Whether a real KiCad honours
+    /// those on update is unconfirmed (#202); this is the case the readback
+    /// has to catch if it does not.
+    keep_mirror_and_alignment_on_update: bool,
     refuse_bounding_boxes: bool,
+}
+
+/// Put `old`'s mirror flag and alignments back on `new`.
+fn keep_mirror_and_alignment(
+    old: Option<&kiapi::board::types::BoardText>,
+    new: Option<&mut kiapi::board::types::BoardText>,
+) {
+    let (Some(old), Some(new)) = (old, new) else {
+        return;
+    };
+    let old = old.text.as_ref().unwrap().attributes.as_ref().unwrap();
+    let new = new.text.as_mut().unwrap().attributes.as_mut().unwrap();
+    new.mirrored = old.mirrored;
+    new.horizontal_alignment = old.horizontal_alignment;
+    new.vertical_alignment = old.vertical_alignment;
 }
 
 const RAW_REVISION_TEXT: &str = "Rev ${REVISION}";
@@ -3469,15 +3492,27 @@ fn spawn_text_board(board: Arc<Mutex<TextBoard>>) -> MockKicad {
                 if !board.reject_updates && !board.ignore_updates {
                     for item in &request.items {
                         if builders::any_is(item, "kiapi.board.types.FootprintInstance") {
-                            let updated = kiapi::board::types::FootprintInstance::decode(
+                            let mut updated = kiapi::board::types::FootprintInstance::decode(
                                 item.value.as_slice(),
                             )
                             .unwrap();
+                            let keep_style = board.keep_mirror_and_alignment_on_update;
                             let slot = board
                                 .footprints
                                 .iter_mut()
                                 .find(|footprint| footprint.id == updated.id)
                                 .expect("update names an existing footprint");
+                            if keep_style {
+                                for (old, new) in [
+                                    (&slot.reference_field, &mut updated.reference_field),
+                                    (&slot.value_field, &mut updated.value_field),
+                                ] {
+                                    keep_mirror_and_alignment(
+                                        old.as_ref().and_then(|field| field.text.as_ref()),
+                                        new.as_mut().and_then(|field| field.text.as_mut()),
+                                    );
+                                }
+                            }
                             *slot = updated;
                         } else if builders::any_is(item, "kiapi.board.types.BoardText") {
                             let mut updated =
@@ -3494,11 +3529,15 @@ fn spawn_text_board(board: Arc<Mutex<TextBoard>>) -> MockKicad {
                                     .font_name
                                     .clear();
                             }
+                            let keep_style = board.keep_mirror_and_alignment_on_update;
                             let slot = board
                                 .texts
                                 .iter_mut()
                                 .find(|text| text.id == updated.id)
                                 .expect("update names an existing text");
+                            if keep_style {
+                                keep_mirror_and_alignment(Some(&*slot), Some(&mut updated));
+                            }
                             *slot = updated;
                         } else {
                             panic!("unexpected update of {}", item.type_url);
@@ -3834,6 +3873,267 @@ fn a_kicad_that_loses_the_font_face_is_reported_uncertain() {
         mismatches,
         ["text.font_name: expected \"Osifont\", observed \"\"".to_string()]
     );
+}
+
+/// The case that prompted #202: a text moved to the back silkscreen stays
+/// unmirrored until something can set the flag.
+#[test]
+fn board_text_style_attributes_are_written_and_proven_by_readback() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document,
+            "rev-text",
+            &konnect_ipc::IpcTextEdit {
+                layer: Some("B.SilkS".to_string()),
+                mirrored: Some(true),
+                horizontal_alignment: Some(konnect_ipc::IpcHorizontalAlignment::Right),
+                vertical_alignment: Some(konnect_ipc::IpcVerticalAlignment::Center),
+                bold: Some(false),
+                italic: Some(true),
+                keep_upright: Some(false),
+                knockout: Some(true),
+                locked: Some(true),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("edit applies");
+    let konnect_ipc::IpcTextEditOutcome::Applied { before, after } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let (before, after) = (before.state.unwrap(), after.state.unwrap());
+    assert_eq!(after.layer, "B.SilkS");
+    assert!(after.mirrored && !before.mirrored);
+    assert_eq!(after.horizontal_alignment, "right");
+    assert_eq!(after.vertical_alignment, "center");
+    assert!(!after.bold && after.italic && !after.keep_upright);
+    assert!(after.knockout && after.locked);
+    // The properties the edit did not name, the ones a delete-and-recreate
+    // loses.
+    assert_eq!(after.text, RAW_REVISION_TEXT);
+    assert_eq!(after.font_name, "Osifont");
+    assert_eq!((after.size_x_nm, after.size_y_nm), (1_200_000, 1_300_000));
+    assert_eq!((after.x_nm, after.y_nm), (before.x_nm, before.y_nm));
+    assert_eq!(after.angle_deg, before.angle_deg);
+    assert_eq!(after.stroke_width_nm, before.stroke_width_nm);
+
+    let board = board.lock().unwrap();
+    assert_eq!(board.updates.len(), 1, "one update for one edit");
+    let sent = kiapi::board::types::BoardText::decode(board.updates[0].value.as_slice()).unwrap();
+    assert_eq!(
+        sent.locked,
+        kiapi::common::types::LockedState::LsLocked as i32
+    );
+    assert!(sent.knockout);
+    assert!(sent.text.unwrap().attributes.unwrap().mirrored);
+}
+
+/// Item 3 of #202: one edit moves a text to the back and mirrors it, and the
+/// same option on the way back to the front clears the flag.
+#[test]
+fn mirroring_to_match_the_layer_sets_and_clears_the_flag_with_the_side() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+    let to = |layer: &str| konnect_ipc::IpcTextEdit {
+        layer: Some(layer.to_string()),
+        mirror_to_match_layer: true,
+        ..Default::default()
+    };
+    let applied =
+        |outcome: konnect_ipc::IpcTextEditOutcome<konnect_ipc::IpcBoardTextItem>| match outcome {
+            konnect_ipc::IpcTextEditOutcome::Applied { after, .. } => after,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("B.SilkS"), |_| Ok(()))
+            .expect("to the back"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("B.SilkS", true));
+    // The option changes the flag and the layer, not the placement.
+    assert_eq!((text.x_nm, text.y_nm), (20_000_000, 30_000_000));
+    assert_eq!(text.angle_deg, 90.0);
+    assert_eq!(text.horizontal_alignment, "left");
+
+    let after = applied(
+        client
+            .edit_board_text_in(document.clone(), "rev-text", &to("F.SilkS"), |_| Ok(()))
+            .expect("back to the front"),
+    );
+    let text = after.state.unwrap();
+    assert_eq!((text.layer.as_str(), text.mirrored), ("F.SilkS", false));
+
+    // A footprint field takes the same option.
+    let outcome = client
+        .edit_footprint_field_in(
+            document.clone(),
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &to("B.SilkS"),
+        )
+        .expect("field to the back");
+    let konnect_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(
+        (state(&after).layer.as_str(), state(&after).mirrored),
+        ("B.SilkS", true)
+    );
+
+    // Nothing to do is nothing sent: the field is already mirrored on the back.
+    let sent = board.lock().unwrap().updates.len();
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &konnect_ipc::IpcTextEdit {
+                mirror_to_match_layer: true,
+                ..Default::default()
+            },
+        )
+        .expect("no-op");
+    assert!(
+        matches!(outcome, konnect_ipc::IpcTextEditOutcome::Unchanged { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(board.lock().unwrap().updates.len(), sent);
+}
+
+#[test]
+fn a_font_face_is_replaced_or_cleared_for_the_stroke_font() {
+    let board = text_board();
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+    for (font, expected) in [("Arial", "Arial"), ("", "")] {
+        let outcome = client
+            .edit_board_text_in(
+                document.clone(),
+                "rev-text",
+                &konnect_ipc::IpcTextEdit {
+                    font_name: Some(font.to_string()),
+                    ..Default::default()
+                },
+                |_| Ok(()),
+            )
+            .expect("edit applies");
+        let konnect_ipc::IpcTextEditOutcome::Applied { after, .. } = outcome else {
+            panic!("expected Applied, got {outcome:?}");
+        };
+        assert_eq!(after.state.unwrap().font_name, expected);
+    }
+}
+
+/// Nobody has confirmed that KiCad's `UpdateItems` honours `mirrored` and
+/// the alignments (#202). If it does not, the edit must not read as success.
+#[test]
+fn a_kicad_that_keeps_the_old_mirror_flag_and_alignment_is_reported_uncertain() {
+    let board = text_board();
+    board.lock().unwrap().keep_mirror_and_alignment_on_update = true;
+    let mock = spawn_text_board(board);
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_board_text_in(
+            document.clone(),
+            "rev-text",
+            &konnect_ipc::IpcTextEdit {
+                mirrored: Some(true),
+                horizontal_alignment: Some(konnect_ipc::IpcHorizontalAlignment::Center),
+                position_nm: Some((21_000_000, 30_000_000)),
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .expect("an uncertain outcome, not an error");
+    let konnect_ipc::IpcTextEditOutcome::Uncertain {
+        mismatches,
+        observed,
+        ..
+    } = outcome
+    else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        [
+            "text.horizontal_alignment: expected \"center\", observed \"left\"".to_string(),
+            "text.mirrored: expected true, observed false".to_string(),
+        ]
+    );
+    // The part KiCad did apply is in the evidence, not hidden.
+    assert_eq!(observed.unwrap().state.unwrap().x_nm, 21_000_000);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &konnect_ipc::IpcTextEdit {
+                mirrored: Some(true),
+                ..Default::default()
+            },
+        )
+        .expect("an uncertain outcome, not an error");
+    let konnect_ipc::IpcTextEditOutcome::Uncertain { mismatches, .. } = outcome else {
+        panic!("expected Uncertain, got {outcome:?}");
+    };
+    assert_eq!(
+        mismatches,
+        ["reference.mirrored: expected true, observed false".to_string()]
+    );
+}
+
+#[test]
+fn a_field_takes_the_same_style_attributes_and_keeps_the_rest_of_its_footprint() {
+    let board = text_board();
+    let mock = spawn_text_board(board.clone());
+    let (client, document) = text_client(&mock);
+
+    let outcome = client
+        .edit_footprint_field_in(
+            document,
+            "R1",
+            konnect_ipc::IpcFootprintFieldSlot::Reference,
+            &konnect_ipc::IpcTextEdit {
+                layer: Some("B.SilkS".to_string()),
+                mirrored: Some(true),
+                horizontal_alignment: Some(konnect_ipc::IpcHorizontalAlignment::Center),
+                vertical_alignment: Some(konnect_ipc::IpcVerticalAlignment::Center),
+                bold: Some(false),
+                keep_upright: Some(false),
+                font_name: Some("Osifont".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("edit applies");
+    let konnect_ipc::IpcTextEditOutcome::Applied { before, after } = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    let (before, after) = (state(&before).clone(), state(&after).clone());
+    assert!(after.mirrored);
+    assert_eq!(after.layer, "B.SilkS");
+    assert_eq!(after.horizontal_alignment, "center");
+    assert_eq!(after.vertical_alignment, "center");
+    assert!(before.bold && !after.bold);
+    assert!(before.keep_upright && !after.keep_upright);
+    assert_eq!(after.font_name, "Osifont");
+    assert_eq!(after.text, "R1");
+    assert_eq!((after.x_nm, after.y_nm), (before.x_nm, before.y_nm));
+    assert_eq!(after.stroke_width_nm, before.stroke_width_nm);
+
+    let board = board.lock().unwrap();
+    let pristine = kicad_footprint("fp-r1", "R1");
+    assert_eq!(board.footprints[0].value_field, pristine.value_field);
+    assert_eq!(board.footprints[0].definition, pristine.definition);
+    assert_eq!(board.footprints[1], kicad_footprint("fp-r2", "R2"));
 }
 
 #[test]

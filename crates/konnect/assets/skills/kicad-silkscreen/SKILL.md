@@ -71,6 +71,17 @@ treat each placed text as an obstacle for the next.
   same frame the listing reports.
 - `edit_board_text` changes a board text selected by UUID. It preserves the
   font face and the raw variable text.
+- Both tools also set `mirrored`, `horizontal_alignment`, `vertical_alignment`,
+  `bold`, `italic`, `keep_upright`, `knockout`, `locked` and `font`. Text on a
+  back layer must be mirrored to read correctly from the back; changing `layer`
+  alone does not mirror it. Pass `mirror: "auto"` to set the flag from the side
+  of the layer the text ends on (with `layer`, or alone for text already moved).
+
+- `set_footprint_field_style` sets the glyph size and stroke thickness of the
+  reference or value field on many footprints in one call, or on every
+  footprint. Use it when DRC reports the same text-thickness or text-height
+  finding on many references. It also works on a board that is not open in
+  KiCad, by editing the saved file.
 
 After each edit, compare the returned bounding box centre with the intended
 centre and correct the position once if they differ. Then save, call `run_drc`

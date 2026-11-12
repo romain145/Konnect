@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **235 registered tools** + **7 always-visible meta-tools** = **242 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -205,7 +205,7 @@ and Windows servers do not.
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
-| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
+| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. KiCad 10's API cannot carry a pad's fabrication property (heatsink, BGA, mechanical, castellated, ...), so an added footprint whose library pads have one is placed without it: `dropped_pad_properties` lists each such footprint, its parts and pads, with a `pad_fabrication_property_dropped` diagnostic, and the plan stays `ready`. |
 
 ### `sch_hierarchy` · 14 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 17 tools
+### `pcb_board` · 18 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import; inspect and edit placed board text and footprint reference/value fields in place.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs), [`crates/konnect-core/src/tools/pcb_text.rs`](crates/konnect-core/src/tools/pcb_text.rs)
 
@@ -250,9 +250,10 @@ and Windows servers do not.
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `list_board_texts` | List board-level text items with their UUID, raw text (including any `${VARIABLE}`), board-absolute position, angle, glyph size, thickness, font face, layer, alignment, and KiCad's bounding box. Live only. |
-| `edit_board_text` | Move, rotate, resize, re-layer or re-word one board-level text item in place by UUID, preserving every property not named (font face, non-square size, raw variable text). Refuses when the live text has lost a text variable the saved board holds. One undo step; fresh readback. Live only. |
+| `edit_board_text` | Move, rotate, resize, re-layer, re-word or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) one board-level text item in place by UUID, preserving every property not named (font face, non-square size, raw variable text). `mirror: "auto"` sets `mirrored` from the side of the layer the text ends on. Refuses when the live text has lost a text variable the saved board holds. One undo step; fresh readback, and a property KiCad did not take is an error. Live only. |
 | `list_footprint_fields` | List the reference, value and other fields of one or every placed footprint with board-absolute position, absolute angle, glyph size, thickness, layer, visibility, alignment, and KiCad's bounding box. Live only. |
-| `edit_footprint_field` | Move, rotate, resize, hide/show, or re-layer a placed footprint's reference or value field in place, preserving every property not named. One undo step; fresh readback, and a mismatch is an error. Live only. |
+| `edit_footprint_field` | Move, rotate, resize, hide/show, re-layer or restyle (`mirrored`, `horizontal_alignment`, `vertical_alignment`, `bold`, `italic`, `keep_upright`, `knockout`, `locked`, `font`) a placed footprint's reference or value field in place, preserving every property not named. `mirror: "auto"` sets `mirrored` from the side of the layer the field ends on. One undo step; fresh readback, and a mismatch is an error. Live only. |
+| `set_footprint_field_style` | Set the glyph size and/or stroke thickness of the reference or value field on the named footprints, or on every footprint: the repair for fields below a minimum text thickness. Live in one undo step when KiCad holds the board, otherwise a revision-checked edit of the saved file (`source` says which). Lists each field's values before and after from a fresh readback. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
@@ -350,8 +351,8 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
-| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions, independent dimensions, and the pad's zone connection override. |
+| `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. A pad's optional `fabrication_property` (`castellated`, `heatsink`, `testpoint`, `bga`, `fiducial_glob`, `fiducial_loc`, `mechanical`, `pressfit`) is written as KiCad writes it; the response lists the pads that carry one under `pad_fabrication_properties`. |
+| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions, independent dimensions, the pad's zone connection override, and its `fabrication_property` (`castellated`, `heatsink`, `testpoint`, `bga`, `fiducial_glob`, `fiducial_loc`, `mechanical`, `pressfit`, or `none` to remove it), reported as read off the written pad. |
 | `set_footprint_graphics` | Atomically append, replace, or delete line, arc, rectangle, circle, and polygon primitives on one footprint layer. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
@@ -364,7 +365,7 @@ and Windows servers do not.
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
-| `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
+| `get_footprint_info` | Return detailed information about a footprint. With `include_pads`, each pad reports its `fabrication_property` (`none` when it has none). Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Search for footprints across all registered libraries by name or keyword. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
 
@@ -397,15 +398,17 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 10 tools
+### `verification` · 12 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
-| `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. The summary's `by_rule` counts errors and warnings per rule over everything at or above `severity`, so a rule that fills the `limit` does not hide the others; the optional `rules` include list narrows the listed violations to those rule keys and leaves the counts whole. The summary's `ignored_checks` lists the checks KiCad had switched off (severity `ignore`): they were not run, so a count of zero says nothing about them. |
+| `set_design_rules` | Set board-wide DRC minima in the sibling `.kicad_pro` project file: clearance, trace width, via size and drill, hole to hole, copper to board edge (`min_copper_edge_clearance`), and silkscreen text height and thickness (`min_text_height`, `min_text_thickness`). Omitted values are kept, a call that changes nothing does not rewrite the file, and the response carries the rules re-read from the saved file. The board file is not modified. Each value must lie in the range KiCad loads (0 to 25 mm; 0 to 10 mm for `min_hole_to_hole`, 0 to 100 mm for `min_text_height`), which the schema advertises as `minimum`/`maximum`: KiCad resets a value outside it to its default on load, so it is refused as `invalid_argument` and nothing is written. |
+| `get_design_rules` | Return the board-wide DRC minima from the sibling `.kicad_pro` project file, including copper-to-edge clearance and the silkscreen text minima; a rule the file does not hold is `null`. |
+| `get_drc_severities` | Return the severity (`error`, `warning`, `ignore`) of every DRC check in the sibling `.kicad_pro` (Board Setup → Design Rules → Violation Severity), with `ignored_checks` listing the ones switched off. Always reads the project file (`source: "project_file"`); `board_open_in_kicad` says whether KiCad holds the board, in which case the file can be older than what KiCad holds. |
+| `set_drc_severities` | Merge a map of check key → `error` / `warning` / `ignore` into the sibling `.kicad_pro`. Checks not named keep their severity, a call that changes nothing does not rewrite the file, and the response carries the severities re-read from the saved file. A key the project's KiCad did not save, or any other value, is refused as `invalid_argument`. Refuses while KiCad holds the board open, and returns `conflict` if the project file changed between read and write. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |

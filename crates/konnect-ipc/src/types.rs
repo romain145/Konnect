@@ -357,6 +357,53 @@ pub struct IpcPadDefinition {
     pub roundrect_ratio: f64,
 }
 
+/// A graphic's line style, as `(stroke (type …))` names it in a footprint.
+///
+/// Carried with every library graphic because the alternative is the protobuf
+/// default, `SLS_UNKNOWN`, which KiCad stores as `default`: a refresh then
+/// rewrote each `(type solid)` stroke of a stock footprint as `(type default)`
+/// (#200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcStrokeStyle {
+    /// `default`. Also given to a stroke that names no type.
+    #[default]
+    Default,
+    Solid,
+    Dash,
+    Dot,
+    DashDot,
+    DashDotDot,
+}
+
+impl IpcStrokeStyle {
+    /// The style a `(type …)` token names, or `None` for a token KiCad does
+    /// not write.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "default" => Self::Default,
+            "solid" => Self::Solid,
+            "dash" => Self::Dash,
+            "dot" => Self::Dot,
+            "dash_dot" => Self::DashDot,
+            "dash_dot_dot" => Self::DashDotDot,
+            _ => return None,
+        })
+    }
+
+    /// The wire value. Never `SLS_UNKNOWN`.
+    pub fn to_proto(self) -> crate::gen::kiapi::common::types::StrokeLineStyle {
+        use crate::gen::kiapi::common::types::StrokeLineStyle;
+        match self {
+            Self::Default => StrokeLineStyle::SlsDefault,
+            Self::Solid => StrokeLineStyle::SlsSolid,
+            Self::Dash => StrokeLineStyle::SlsDash,
+            Self::Dot => StrokeLineStyle::SlsDot,
+            Self::DashDot => StrokeLineStyle::SlsDashdot,
+            Self::DashDotDot => StrokeLineStyle::SlsDashdotdot,
+        }
+    }
+}
+
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from
 /// the library `.kicad_mod` source.
 ///
@@ -372,6 +419,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
     },
     /// `fp_rect` — axis-aligned rectangle between two opposite corners.
     Rect {
@@ -379,6 +427,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// `fp_circle` — center plus a point on the circumference.
@@ -387,6 +436,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// `fp_arc` — start / mid / end points.
@@ -396,12 +446,14 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
     },
     /// `fp_poly` — closed outline.
     Poly {
         points: Vec<(f64, f64)>,
         layer: String,
         width: f64,
+        style: IpcStrokeStyle,
         filled: bool,
     },
     /// Visible `fp_text` / `property` text.
@@ -651,12 +703,79 @@ pub enum UnavailableReason {
 /// from the library footprint so placed parts keep the library's text
 /// positions. A hardcoded offset put the Reference on top of the part's own
 /// silkscreen (silk_overlap DRC warnings in live verification).
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `reference_style`/`value_style` carry how the library draws each field.
+/// Without them a placed part's fields were built from protobuf defaults, which
+/// KiCad saved as `(unlocked yes)`, no font thickness and `(line_spacing 0)`,
+/// with the Value hidden on the silkscreen instead of shown on `F.Fab` (#201).
+#[derive(Debug, Clone, Default)]
 pub struct IpcFieldPlacement {
     /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
     pub reference_at: Option<(f64, f64, f64)>,
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
     pub value_at: Option<(f64, f64, f64)>,
+    /// The library's presentation of the Reference text. `None` when the
+    /// footprint did not come from a library (inline geometry).
+    pub reference_style: Option<IpcFieldStyle>,
+    /// The library's presentation of the Value text.
+    pub value_style: Option<IpcFieldStyle>,
+}
+
+/// How a library footprint draws one of its fields: everything a
+/// `(property …)` states besides its text and `(at …)`.
+///
+/// Each member holds what KiCad reads from the file, including KiCad's own
+/// value for a clause the file leaves out, so the placed field saves back as
+/// the library wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcFieldStyle {
+    /// KiCad layer name from `(layer …)`.
+    pub layer: String,
+    /// False for `(hide yes)`.
+    pub visible: bool,
+    /// Glyph (width, height) in mm from `(font (size h w))`.
+    pub size: (f64, f64),
+    /// `(font (thickness …))` in mm. `None` when the library names none, which
+    /// KiCad keeps as a zero thickness and draws at a width derived from the
+    /// glyph size.
+    pub thickness_mm: Option<f64>,
+    /// `(font (line_spacing …))`; KiCad's value when absent is 1.
+    pub line_spacing: f64,
+    /// `(font (face …))`; empty for KiCad's built-in stroke font.
+    pub font_face: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// `(justify left|right)`; centered when absent.
+    pub horizontal_alignment: crate::gen::kiapi::common::types::HorizontalAlignment,
+    /// `(justify top|bottom)`; centered when absent.
+    pub vertical_alignment: crate::gen::kiapi::common::types::VerticalAlignment,
+    /// `(justify mirror)`.
+    pub mirrored: bool,
+    /// KiCad's "keep upright". The file states only the opposite, as
+    /// `(unlocked yes)`, so this is true unless that clause is present.
+    pub keep_upright: bool,
+}
+
+impl IpcFieldStyle {
+    /// The style a field gets when no library describes it: KiCad's own
+    /// defaults for footprint text (1 mm glyphs, 0.15 mm thickness, single
+    /// line spacing, centered, kept upright) on `layer`.
+    pub fn kicad_default(layer: &str, visible: bool) -> Self {
+        Self {
+            layer: layer.to_string(),
+            visible,
+            size: (1.0, 1.0),
+            thickness_mm: Some(0.15),
+            line_spacing: 1.0,
+            font_face: String::new(),
+            bold: false,
+            italic: false,
+            horizontal_alignment: crate::gen::kiapi::common::types::HorizontalAlignment::HaCenter,
+            vertical_alignment: crate::gen::kiapi::common::types::VerticalAlignment::VaCenter,
+            mirrored: false,
+            keep_upright: true,
+        }
+    }
 }
 
 /// A three-component value as KiCad's `Vector3D` message carries it.
@@ -911,12 +1030,138 @@ pub struct IpcTextEdit {
     pub text: Option<String>,
     /// Field visibility. Footprint fields only.
     pub visible: Option<bool>,
+    /// Draw the glyphs mirrored, as text on a back layer must be to read
+    /// correctly from that side.
+    pub mirrored: Option<bool>,
+    /// Set `mirrored` from the side of the layer the text ends up on: true on
+    /// a back layer, false on a front layer, untouched on a layer with no
+    /// side. That layer is the one this edit names, or the one KiCad holds
+    /// when it names none. Cannot be combined with `mirrored`.
+    pub mirror_to_match_layer: bool,
+    pub horizontal_alignment: Option<IpcHorizontalAlignment>,
+    pub vertical_alignment: Option<IpcVerticalAlignment>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub keep_upright: Option<bool>,
+    pub knockout: Option<bool>,
+    pub locked: Option<bool>,
+    /// Font face name; the empty string selects KiCad's stroke font.
+    pub font_name: Option<String>,
+}
+
+/// The mirror flag text on the layer named `layer` needs to read correctly
+/// from its own side of the board: set on a back layer (`B.SilkS`), clear on
+/// a front one (`F.Fab`). `None` for a layer with no side (inner copper,
+/// `Edge.Cuts`, the user layers), where neither value is the right one.
+///
+/// This is the end state KiCad's Flip leaves a normally-drawn text in. Flip
+/// itself toggles the flag; setting it from the side instead also repairs a
+/// text that was moved to the back without being mirrored, which a toggle
+/// from the same layer could not.
+pub fn mirrored_for_layer_name(layer: &str) -> Option<bool> {
+    if layer.starts_with("B.") {
+        Some(true)
+    } else if layer.starts_with("F.") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// A horizontal text alignment a caller may request. KiCad's
+/// `HA_INDETERMINATE` describes a mixed selection in its dialogs and is not a
+/// value one text can be given, so it has no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcHorizontalAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl IpcHorizontalAlignment {
+    /// The name `IpcTextState::horizontal_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Left, Self::Center, Self::Right]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
+}
+
+/// A vertical text alignment a caller may request; see
+/// [`IpcHorizontalAlignment`] for why there is no indeterminate variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcVerticalAlignment {
+    Top,
+    Center,
+    Bottom,
+}
+
+impl IpcVerticalAlignment {
+    /// The name `IpcTextState::vertical_alignment` reports for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Center => "center",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Top, Self::Center, Self::Bottom]
+            .into_iter()
+            .find(|alignment| alignment.as_str() == name)
+    }
 }
 
 impl IpcTextEdit {
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+/// One field a batch edit covered, before the edit and as a fresh read holds
+/// it afterwards. The two are equal for a field that already held every
+/// requested value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldChange {
+    pub before: IpcFootprintField,
+    pub after: IpcFootprintField,
+}
+
+/// A field a whole-board batch edit left alone because it could not be
+/// edited and proven; never a field the caller named explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldSkip {
+    pub footprint_reference: String,
+    pub footprint_kiid: String,
+    pub slot: String,
+    pub reason: String,
+}
+
+/// Readback-derived result of applying one edit to fields of many footprints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprintFieldBatchOutcome {
+    /// Every covered field holds the requested values, proven by a fresh
+    /// read. `sent` is false when they all did already and nothing was sent.
+    Settled {
+        fields: Vec<IpcFootprintFieldChange>,
+        skipped: Vec<IpcFootprintFieldSkip>,
+        sent: bool,
+    },
+    /// The update may have changed the board, but a fresh read did not prove
+    /// the requested state for every footprint. Inspect before retrying.
+    Uncertain {
+        mismatches: Vec<String>,
+        reason: String,
+    },
 }
 
 /// Readback-derived result of editing one text item in place.

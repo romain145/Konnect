@@ -23,7 +23,12 @@ pub fn tools() -> Vec<ToolDef> {
              with separate error and warning counts in the summary. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
-             complete configured DRC ruleset; kicad-cli has no per-test selector.",
+             complete configured DRC ruleset; kicad-cli has no per-test selector. \
+             `by_rule` counts errors and warnings per rule over everything at or above \
+             `severity`, so a rule that fills the listing does not hide the others; pass \
+             `rules` to list only some of them. `ignored_checks` names the checks whose \
+             severity is ignore: they were not run, so no violation count covers them (see \
+             `get_drc_severities` / `set_drc_severities`).",
             json!({
                 "type": "object",
                 "properties": {
@@ -40,6 +45,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Maximum number of violations to return",
                         "default": 50
+                    },
+                    "rules": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "List only violations of these rule keys (a violation's `rule`, the keys of `by_rule`), e.g. [\"clearance\", \"silk_overlap\"]. Omit to list every rule. The summary counts, `by_rule` included, are not narrowed by it."
                     }
                 },
                 "required": ["board"]
@@ -48,26 +59,23 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
-             project file. Refuses while KiCad holds the board open, because KiCad's next save \
-             rewrites the project file from its own copy.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "min_clearance": { "type": "number", "description": "Minimum clearance in mm" },
-                    "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
-                    "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
-                    "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
-                },
-                "required": ["board"]
-            }),
+            "Set board-wide DRC minima (clearance, trace width, via size and drill, hole to \
+             hole, copper to board edge, silkscreen text height and thickness) in the sibling \
+             KiCAD project file. Omitted values are kept, and a call that changes nothing does \
+             not rewrite the file. Refuses while KiCad holds the board open, because KiCad's \
+             next save rewrites the project file from its own copy. Each value must lie in the \
+             range KiCad loads (the schema's minimum and maximum): KiCad replaces a value \
+             outside it with its default when it opens the project, so such a value is refused \
+             and nothing is written. Returns the rules as re-read from the saved file.",
+            set_design_rules_schema(),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
         ),
         tool!(
             "get_design_rules",
-            "Return the current design rule constraints defined in the sibling KiCAD project file.",
+            "Return the board-wide DRC minima stored in the sibling KiCAD project file: \
+             clearance, trace width, via size and drill, hole to hole, copper to board edge, \
+             and silkscreen text height and thickness, in mm. A rule the file does not hold is \
+             null.",
             json!({
                 "type": "object",
                 "properties": {
@@ -76,6 +84,51 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_design_rules(args, ctx).await }
+        ),
+        tool!(
+            "get_drc_severities",
+            "Return the severity of every DRC check (Board Setup > Design Rules > Violation \
+             Severity) from the sibling KiCAD project file: `severities` maps each check key \
+             to error, warning or ignore, and `ignored_checks` lists the ones switched off. A \
+             check set to ignore never appears in `run_drc`, so read this before trusting a \
+             clean result. Always reads the project file (`source`); `board_open_in_kicad` \
+             says whether KiCad holds the board, in which case the file can be older than \
+             Board Setup in KiCad until the board is saved.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_get_drc_severities(args, ctx).await }
+        ),
+        tool!(
+            "set_drc_severities",
+            "Set the severity of DRC checks in the sibling KiCAD project file. `severities` \
+             maps a check key (as `get_drc_severities` and a `run_drc` violation's `rule` \
+             name it) to error, warning or ignore, and is merged: checks not named keep \
+             their severity, and a call that changes nothing does not rewrite the file. A \
+             key the project's KiCad did not save is refused, because KiCad skips a key it \
+             does not know and drops it on save. Refuses while KiCad holds the board open, \
+             because KiCad's next save rewrites the project file from its own copy; close \
+             the board, set, reopen. Returns the severities re-read from the saved file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
+                    "severities": {
+                        "type": "object",
+                        "description": "Check key to severity, e.g. {\"silk_overlap\": \"error\", \"missing_courtyard\": \"ignore\"}",
+                        "additionalProperties": {
+                            "type": "string",
+                            "enum": DRC_SEVERITIES
+                        }
+                    }
+                },
+                "required": ["board", "severities"]
+            }),
+            |args, ctx| async move { handle_set_drc_severities(args, ctx).await }
         ),
         tool!(
             "set_predefined_sizes",
@@ -251,6 +304,11 @@ async fn handle_run_drc(
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    // Refused before DRC runs: a mistyped filter should not cost a KiCad run.
+    let rules_filter = match rules_argument(args) {
+        Ok(rules) => rules,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -275,8 +333,38 @@ async fn handle_run_drc(
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
-    let shown = filtered.len().min(limit);
-    let truncated = filtered.len() > limit;
+    // Counted over everything at this severity, before `rules` and `limit`
+    // narrow the listing: when one rule fills the listing, this is the only
+    // place the others show at all (#188).
+    let mut by_rule = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+    for violation in &filtered {
+        let counts = by_rule.entry(violation.rule.as_str()).or_default();
+        match violation.severity.as_str() {
+            "error" => counts.0 += 1,
+            "warning" => counts.1 += 1,
+            _ => {}
+        }
+    }
+    let by_rule: serde_json::Map<String, Value> = by_rule
+        .into_iter()
+        .map(|(rule, (errors, warnings))| {
+            (
+                rule.to_string(),
+                json!({ "errors": errors, "warnings": warnings }),
+            )
+        })
+        .collect();
+    // `rules` chooses what is listed. The counts above stay whole, so the
+    // caller still sees what it filtered out.
+    let listed: Vec<_> = filtered
+        .iter()
+        .filter(|violation| match &rules_filter {
+            Some(rules) => rules.contains(&violation.rule.as_str()),
+            None => true,
+        })
+        .collect();
+    let shown = listed.len().min(limit);
+    let truncated = listed.len() > limit;
     let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
@@ -296,13 +384,21 @@ async fn handle_run_drc(
             // beside the board — kicad-cli writes an empty array then, which
             // is not a checked zero (#516).
             "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
+            // The checks this run had switched off, from KiCad's own report.
+            // None of them can appear below, so a count of zero says nothing
+            // about them (#203). Null when the report carries no such list.
+            "ignored_checks": report.ignored_checks.as_ref().map(|checks| {
+                checks.iter().map(|check| check.key.as_str()).collect::<Vec<_>>()
+            }),
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
+            "by_rule": by_rule,
+            "rules_filter": rules_filter,
             "shown": shown,
             "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
+            "violations": listed.iter().take(limit).map(|v| json!({
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,
@@ -312,6 +408,34 @@ async fn handle_run_drc(
         }))
         .unwrap(),
     ))
+}
+
+/// `run_drc`'s optional `rules` include list: the rule keys whose violations
+/// to list. Absent means every rule.
+fn rules_argument(args: &Value) -> Result<Option<Vec<&str>>, CallToolResult> {
+    let rules = match args.get("rules") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(rules) => rules.as_array().ok_or_else(|| {
+            crate::tools::invalid_arg("rules", "not an array of rule keys such as 'clearance'")
+        })?,
+    };
+    // An empty list would list nothing and look like a clean board.
+    if rules.is_empty() {
+        return Err(crate::tools::invalid_arg(
+            "rules",
+            "empty; name at least one rule key, or omit `rules` to list every rule",
+        ));
+    }
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            rule.as_str().ok_or_else(|| {
+                crate::tools::invalid_arg(&format!("rules[{index}]"), "not a string")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Write a report, creating the directory the caller named.
@@ -362,6 +486,152 @@ fn project_rules_mut(
 
 fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
+}
+
+/// One board-wide minimum in the project file's
+/// `board.design_settings.rules`.
+struct DesignRule {
+    /// The `set_design_rules` argument and the `get_design_rules` key.
+    argument: &'static str,
+    /// KiCad's key in the project file.
+    project_key: &'static str,
+    /// The inclusive range, in mm, that KiCad loads. Outside it KiCad drops
+    /// the stored value for its own default when it opens the project, and
+    /// DRC then runs with a limit nobody asked for (#196).
+    range_mm: (f64, f64),
+    description: &'static str,
+}
+
+/// The minima `set_design_rules` writes and `get_design_rules` reports.
+///
+/// Each `range_mm` is the `PARAM_SCALED` min/max KiCad 10.0 registers for the
+/// key in `pcbnew/board_design_settings.cpp`; its `Load` keeps a value that
+/// lies between them, bounds included, and takes the default otherwise. #196
+/// measured that on KiCad 10.0.6 for the first five keys: -0.01, 25.01 and
+/// (for `min_hole_to_hole`) 10.01 each loaded as the default. The ranges of
+/// the last three (#194) are read from that source and were not measured.
+fn design_rules() -> &'static [DesignRule] {
+    &[
+        DesignRule {
+            argument: "min_clearance",
+            project_key: "min_clearance",
+            range_mm: (0.0, 25.0),
+            description: "Minimum clearance in mm",
+        },
+        DesignRule {
+            argument: "min_trace_width",
+            project_key: "min_track_width",
+            range_mm: (0.0, 25.0),
+            description: "Minimum trace width in mm",
+        },
+        DesignRule {
+            argument: "min_via_drill",
+            project_key: "min_through_hole_diameter",
+            range_mm: (0.0, 25.0),
+            description: "Minimum via drill diameter in mm",
+        },
+        DesignRule {
+            argument: "min_via_size",
+            project_key: "min_via_diameter",
+            range_mm: (0.0, 25.0),
+            description: "Minimum via pad diameter in mm",
+        },
+        DesignRule {
+            argument: "min_hole_to_hole",
+            project_key: "min_hole_to_hole",
+            range_mm: (0.0, 10.0),
+            description: "Minimum hole-to-hole clearance in mm",
+        },
+        // KiCad also loads -0.01 here, as a flag for the pre-6.0 method that
+        // takes the clearance from the Edge.Cuts line width. That is not a
+        // clearance a caller sets, so the range starts at 0.
+        DesignRule {
+            argument: "min_copper_edge_clearance",
+            project_key: "min_copper_edge_clearance",
+            range_mm: (0.0, 25.0),
+            description: "Minimum copper to board edge clearance in mm",
+        },
+        DesignRule {
+            argument: "min_text_height",
+            project_key: "min_text_height",
+            range_mm: (0.0, 100.0),
+            description: "Minimum silkscreen text height in mm",
+        },
+        DesignRule {
+            argument: "min_text_thickness",
+            project_key: "min_text_thickness",
+            range_mm: (0.0, 25.0),
+            description: "Minimum silkscreen text stroke thickness in mm",
+        },
+    ]
+}
+
+/// `set_design_rules`' input schema, with each rule's range advertised as
+/// `minimum`/`maximum` so the served dispatch refuses a value outside it
+/// before the handler runs.
+fn set_design_rules_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "board".into(),
+        json!({ "type": "string", "description": "Path to .kicad_pcb file" }),
+    );
+    for rule in design_rules() {
+        let (minimum, maximum) = rule.range_mm;
+        properties.insert(
+            rule.argument.into(),
+            json!({
+                "type": "number",
+                "minimum": minimum,
+                "maximum": maximum,
+                "description": format!(
+                    "{}. KiCad loads {minimum} to {maximum} mm and resets any other value to its default.",
+                    rule.description
+                )
+            }),
+        );
+    }
+    json!({ "type": "object", "properties": properties, "required": ["board"] })
+}
+
+/// The value the caller named for `rule`, if any. A value KiCad would not
+/// load is refused here as well as by the schema, because a handler reached
+/// without the served dispatch must not write it either.
+fn design_rule_argument(args: &Value, rule: &DesignRule) -> Result<Option<f64>, CallToolResult> {
+    let value = match args.get(rule.argument) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value.as_f64().ok_or_else(|| {
+            crate::tools::invalid_arg(rule.argument, "not a number (millimetres)")
+        })?,
+    };
+    let (minimum, maximum) = rule.range_mm;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(crate::tools::invalid_arg(
+            rule.argument,
+            &format!(
+                "{value} mm is outside the {minimum} to {maximum} mm KiCad loads for '{}'; KiCad \
+                 would replace it with its default when it opens the project, so nothing was \
+                 written",
+                rule.project_key
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Every rule in the table as `get_design_rules` reports it: the stored
+/// value, or null where the project file has none.
+fn design_rules_readback(project: &Value) -> Value {
+    Value::Object(
+        design_rules()
+            .iter()
+            .map(|rule| {
+                (
+                    rule.argument.to_string(),
+                    json!(project_rule_value(project, rule.project_key)),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
@@ -428,6 +698,16 @@ async fn handle_set_design_rules(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    // Before anything is read or asked of KiCad: one bad value refuses the
+    // whole call, so no rule named beside it is written either.
+    let mut requested = Vec::new();
+    for rule in design_rules() {
+        match design_rule_argument(args, rule) {
+            Ok(Some(value)) => requested.push((rule, value)),
+            Ok(None) => {}
+            Err(refusal) => return Ok(refusal),
+        }
+    }
     // KiCad rewrites the project file from memory when it saves the board, so
     // a rule written here while it holds the board is reverted (#791). Asked
     // before the read too: the file can be older than what KiCad holds.
@@ -442,25 +722,16 @@ async fn handle_set_design_rules(
 
     let mut changed = Vec::new();
 
-    let rules: &[(&str, &str)] = &[
-        ("min_clearance", "min_clearance"),
-        ("min_track_width", "min_trace_width"),
-        ("min_through_hole_diameter", "min_via_drill"),
-        ("min_via_size", "min_via_size"),
-        ("min_hole_to_hole", "min_hole_to_hole"),
-    ];
-
     let project_rules = project_rules_mut(&mut project)?;
-    for (project_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
-            let storage_key = if *project_key == "min_via_size" {
-                "min_via_diameter"
-            } else {
-                project_key
-            };
-            project_rules.insert(storage_key.to_string(), json!(val));
-            changed.push(format!("{} = {}", storage_key, val));
+    for (rule, value) in requested {
+        // A value the file already holds is not a change. Naming only those
+        // leaves the file alone: a rewrite would re-serialise the whole
+        // document for nothing.
+        if project_rules.get(rule.project_key).and_then(Value::as_f64) == Some(value) {
+            continue;
         }
+        project_rules.insert(rule.project_key.to_string(), json!(value));
+        changed.push(format!("{} = {}", rule.project_key, value));
     }
 
     if !changed.is_empty() {
@@ -478,11 +749,18 @@ async fn handle_set_design_rules(
         }
     }
 
+    // What the file holds now, read again rather than echoed from the request.
+    let saved: Value = serde_json::from_str(&read_consistent(&project_path)?)?;
+
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "project": project_path,
-            "changed": changed
+            "changed": changed,
+            "rules": design_rules_readback(&saved),
+            "note": "Board-wide DRC minima in the project file. They set no track, via or text \
+                     size and do not prove a fab will accept the board. KiCad reads them when it \
+                     next opens the project."
         }))
         .unwrap(),
     ))
@@ -501,16 +779,346 @@ async fn handle_get_design_rules(
         serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
             "project": project_path.to_str().unwrap_or(""),
-            "rules": {
-                "min_clearance": project_rule_value(&project, "min_clearance"),
-                "min_trace_width": project_rule_value(&project, "min_track_width"),
-                "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
-                "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
-            }
+            "rules": design_rules_readback(&project)
         }))
         .unwrap(),
     ))
+}
+
+// ─── DRC severities (Board Setup → Design Rules → Violation Severity) ─────────
+//
+// KiCad stores one severity per check in the project file's
+// board.design_settings.rule_severities, a flat map of check key to "error",
+// "warning" or "ignore". An ignored check is not run, so nothing in a DRC
+// report says the board was never tested for it (#203).
+
+/// The three severities a check can be given, as KiCad writes them.
+const DRC_SEVERITIES: [&str; 3] = ["error", "warning", "ignore"];
+
+/// The checks KiCad 10 wrote into `rule_severities` when it saved the
+/// placement fixture's project (`konnect-sexp/tests/fixtures/placement/`).
+///
+/// Used only for a project file that has no block yet, where nothing in the
+/// file says which checks its KiCad knows. A file with a block is its own
+/// list: the set differs between KiCad releases, and KiCad writes every check
+/// it knows whenever it saves the project.
+const KICAD_10_DRC_CHECKS: &[&str] = &[
+    "annular_width",
+    "clearance",
+    "connection_width",
+    "copper_edge_clearance",
+    "copper_sliver",
+    "courtyards_overlap",
+    "creepage",
+    "diff_pair_gap_out_of_range",
+    "diff_pair_uncoupled_length_too_long",
+    "drill_out_of_range",
+    "duplicate_footprints",
+    "extra_footprint",
+    "footprint",
+    "footprint_filters_mismatch",
+    "footprint_symbol_field_mismatch",
+    "footprint_symbol_mismatch",
+    "footprint_type_mismatch",
+    "hole_clearance",
+    "hole_to_hole",
+    "holes_co_located",
+    "invalid_outline",
+    "isolated_copper",
+    "item_on_disabled_layer",
+    "items_not_allowed",
+    "length_out_of_range",
+    "lib_footprint_issues",
+    "lib_footprint_mismatch",
+    "malformed_courtyard",
+    "microvia_drill_out_of_range",
+    "mirrored_text_on_front_layer",
+    "missing_courtyard",
+    "missing_footprint",
+    "missing_tuning_profile",
+    "net_conflict",
+    "nonmirrored_text_on_back_layer",
+    "npth_inside_courtyard",
+    "padstack",
+    "pth_inside_courtyard",
+    "shorting_items",
+    "silk_edge_clearance",
+    "silk_over_copper",
+    "silk_overlap",
+    "skew_out_of_range",
+    "solder_mask_bridge",
+    "starved_thermal",
+    "text_height",
+    "text_on_edge_cuts",
+    "text_thickness",
+    "through_hole_pad_without_hole",
+    "too_many_vias",
+    "track_angle",
+    "track_dangling",
+    "track_on_post_machined_layer",
+    "track_segment_length",
+    "track_width",
+    "tracks_crossing",
+    "tuning_profile_track_geometries",
+    "unconnected_items",
+    "unresolved_variable",
+    "via_dangling",
+    "zones_intersect",
+];
+
+fn project_severities(project: &Value) -> Option<&serde_json::Map<String, Value>> {
+    project["board"]["design_settings"]["rule_severities"].as_object()
+}
+
+/// The checks `severities` switches off, in the block's order.
+fn ignored_checks(severities: &serde_json::Map<String, Value>) -> Vec<&str> {
+    severities
+        .iter()
+        .filter(|(_, severity)| severity.as_str() == Some("ignore"))
+        .map(|(check, _)| check.as_str())
+        .collect()
+}
+
+/// The board's sibling project for the severity tools: its path, the exact
+/// text read (what a later write must still find there) and that text parsed.
+fn load_project_severities(
+    board: &Path,
+) -> anyhow::Result<Result<(PathBuf, String, Value), CallToolResult>> {
+    let project_path = sibling_project_path(board);
+    if !project_path.exists() {
+        return Ok(Err(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: project_path.display().to_string(),
+            },
+            format!(
+                "No project file at {}. DRC severities live in the .kicad_pro beside the board, \
+                 and nowhere else; without one KiCad applies its default severity to every \
+                 check. Create the project (KiCad: File > Save a Copy, or place the board inside \
+                 a project) and retry.",
+                project_path.display()
+            ),
+        )));
+    }
+    let text = read_consistent(&project_path)?;
+    let project: Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
+    Ok(Ok((project_path, text, project)))
+}
+
+/// `severities` and `ignored_checks` as both tools report them. With no
+/// block in the file, `ignored_checks` is null rather than empty: KiCad then
+/// applies its defaults, some of which are `ignore`, and the file does not
+/// say which.
+fn severities_readback(project: &Value) -> (Value, Value) {
+    match project_severities(project) {
+        Some(severities) => (
+            Value::Object(severities.clone()),
+            json!(ignored_checks(severities)),
+        ),
+        None => (json!({}), Value::Null),
+    }
+}
+
+/// Whether KiCad holds `board` open, for a read that answers from the project
+/// file either way: `Some(true)` when KiCad said so, `Some(false)` when it
+/// said otherwise or could not be reached and left no lock, `None` when that
+/// could not be established. With it, the caveat to hand the caller.
+async fn board_open_in_kicad(
+    ctx: &ToolContext,
+    board: &Path,
+) -> anyhow::Result<(Option<bool>, Option<String>)> {
+    use crate::tools::live_board::{self, EditorLock, LiveBoard};
+
+    const STALE: &str = "Board Setup changes made in KiCad since its last save are not in the \
+                         project file, so these values can be older than what KiCad holds. Save \
+                         the board in KiCad to make the file current.";
+    Ok(
+        match live_board::observe(ctx, board, |_, _| Ok(())).await? {
+            LiveBoard::Answered(()) => (
+                Some(true),
+                Some(format!("KiCad holds this board open. {STALE}")),
+            ),
+            LiveBoard::NotOpen { .. } => (Some(false), None),
+            LiveBoard::NeverReached(_) => match live_board::editor_lock(board) {
+                EditorLock::Absent => (Some(false), None),
+                EditorLock::Present(lock) | EditorLock::Unreadable(lock, _) => (
+                    None,
+                    Some(format!(
+                        "KiCad did not answer, but its lock '{}' sits beside the board, so \
+                         whether the board is open is not known. If it is: {STALE}",
+                        lock.display()
+                    )),
+                ),
+            },
+            _ => (
+                None,
+                Some(format!(
+                    "Whether KiCad holds this board open could not be established. If it does: \
+                     {STALE}"
+                )),
+            ),
+        },
+    )
+}
+
+async fn handle_get_drc_severities(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let (project_path, _, project) = match load_project_severities(&board)? {
+        Ok(loaded) => loaded,
+        Err(refusal) => return Ok(refusal),
+    };
+    let (open, warning) = board_open_in_kicad(ctx, &board).await?;
+    let (severities, ignored) = severities_readback(&project);
+
+    let mut body = json!({
+        "board": board,
+        "project": project_path,
+        // There is no other source: KiCad's IPC API has no call for board
+        // design settings, so an open board cannot be asked.
+        "source": "project_file",
+        "board_open_in_kicad": open,
+        "severities": severities,
+        "ignored_checks": ignored
+    });
+    if let Some(warning) = warning {
+        body["warning"] = json!(warning);
+    }
+    if project_severities(&project).is_none() {
+        body["note"] = json!(
+            "The project file has no board.design_settings.rule_severities, so KiCad applies \
+             its default severity to every check, and some defaults are 'ignore'. KiCad writes \
+             the block when it saves the project."
+        );
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+/// The `severities` argument as (check, severity) pairs, each severity one of
+/// KiCad's three words.
+fn parse_severities_argument(args: &Value) -> Result<Vec<(&str, &str)>, CallToolResult> {
+    let requested = args
+        .get("severities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            crate::tools::invalid_arg(
+                "severities",
+                "missing or not a map of check key to 'error', 'warning' or 'ignore'",
+            )
+        })?;
+    requested
+        .iter()
+        .map(|(check, severity)| match severity.as_str() {
+            Some(severity) if DRC_SEVERITIES.contains(&severity) => Ok((check.as_str(), severity)),
+            _ => Err(crate::tools::invalid_arg(
+                &format!("severities.{check}"),
+                &format!("{severity} is not one of 'error', 'warning', 'ignore'"),
+            )),
+        })
+        .collect()
+}
+
+async fn handle_set_drc_severities(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let requested = match parse_severities_argument(args) {
+        Ok(requested) => requested,
+        Err(refusal) => return Ok(refusal),
+    };
+    // As for the design rules: KiCad rewrites the project file from memory
+    // when it saves the board, so a severity written while it holds the board
+    // is reverted (#791), and its IPC API has no call to set one instead.
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "DRC severity").await?
+    {
+        return Ok(refusal);
+    }
+    let (project_path, project_content, mut project) = match load_project_severities(&board)? {
+        Ok(loaded) => loaded,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    // KiCad reads only the keys it knows and writes only those back, so a key
+    // it does not know would be accepted here and gone after its next save.
+    let saved = project_severities(&project).filter(|block| !block.is_empty());
+    for (check, _) in &requested {
+        let known = match saved {
+            Some(block) => block.contains_key(*check),
+            None => KICAD_10_DRC_CHECKS.contains(check),
+        };
+        if !known {
+            let reason = match saved {
+                Some(_) => format!(
+                    "'{check}' is not among the checks in {}'s rule_severities. KiCad writes \
+                     every check it knows when it saves the project and ignores any other key, \
+                     so this one would not take effect. Use a key from get_drc_severities; if a \
+                     newer KiCad added the check, open and save the project in it first",
+                    project_path.display()
+                ),
+                None => format!(
+                    "'{check}' is not a DRC check Konnect knows from KiCad 10, and {} has no \
+                     rule_severities to check it against. Open and save the project in KiCad \
+                     so it writes the checks it knows, then use a key from get_drc_severities",
+                    project_path.display()
+                ),
+            };
+            return Ok(crate::tools::invalid_arg(
+                &format!("severities.{check}"),
+                &reason,
+            ));
+        }
+    }
+
+    let block = project_design_settings_mut(&mut project)?
+        .entry("rule_severities")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "KiCAD project 'board.design_settings.rule_severities' must be a JSON object"
+            )
+        })?;
+    let mut changed = Vec::new();
+    for (check, severity) in requested {
+        let current = block.get(check).cloned().unwrap_or(Value::Null);
+        if current.as_str() == Some(severity) {
+            continue;
+        }
+        block.insert(check.to_string(), json!(severity));
+        changed.push(json!({ "check": check, "from": current, "to": severity }));
+    }
+
+    if !changed.is_empty() {
+        let mut content = serde_json::to_string_pretty(&project)?;
+        content.push('\n');
+        // Only while the file still holds what the severities were merged
+        // into (#197): a save in between would otherwise be replaced by the
+        // older image.
+        if let Some(conflict) = crate::tools::pcb_board::write_project_file(
+            &project_path,
+            "set_drc_severities",
+            &project_content,
+            content,
+        )? {
+            return Ok(conflict);
+        }
+    }
+
+    // What the file holds now, read again rather than echoed from the request.
+    let saved: Value = serde_json::from_str(&read_consistent(&project_path)?)?;
+    let (severities, ignored) = severities_readback(&saved);
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "project": project_path,
+        "changed": changed,
+        "severities": severities,
+        "ignored_checks": ignored,
+        "note": "KiCad reads the change when it next opens the project. run_drc uses it at once."
+    })))
 }
 
 // ─── Pre-defined sizes (Board Setup → Design Rules → Pre-defined Sizes) ───────
@@ -1534,6 +2142,20 @@ fn find_footprint_position(
 
     Ok((fp_x, fp_y))
 }
+
+// Declared here rather than in `tools/mod.rs` so the tests reach this module's
+// private rule table and handlers.
+#[cfg(test)]
+#[path = "design_rules_tests.rs"]
+mod design_rules_tests;
+
+#[cfg(test)]
+#[path = "drc_severities_tests.rs"]
+mod drc_severities_tests;
+
+#[cfg(test)]
+#[path = "run_drc_summary_tests.rs"]
+mod run_drc_summary_tests;
 
 #[cfg(test)]
 mod tests {
