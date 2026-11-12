@@ -211,7 +211,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_power_symbol",
             "Add a power symbol (VCC, GND, etc.) to the schematic. Snaps the position to the \
              1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
-             internal #PWR reference to the lowest number free on the sheet. Preserves every \
+             internal reference under the library's prefix (#PWR; #FLG for PWR_FLAG) to the \
+             lowest number free on the sheet for that prefix. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
             json!({
@@ -332,6 +333,8 @@ pub fn tools() -> Vec<ToolDef> {
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
              Name the pin with reference + pin_number, or give its coordinates directly. \
+             stub_length 0 writes no wire and puts the label on the pin itself, as \
+             batch_connect_to_net does; the response then has no 'wire'. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
              which are one net across all sheets and instances.",
@@ -353,8 +356,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
-                        "description": "Length of the wire stub in mm" },
+                    "stub_length": { "type": "number", "minimum": 0, "default": 2.54,
+                        "description": "Length of the wire stub in mm. 0 writes no wire and \
+                                        places the label on the pin." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -2093,17 +2097,24 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
-/// The lowest `#PWR` number no symbol on the sheet is using.
+/// The reference prefix a power symbol is numbered under when its library
+/// definition names none.
+const DEFAULT_POWER_PREFIX: &str = "#PWR";
+
+/// The lowest number no symbol on the sheet is using under `prefix`.
+///
+/// Each prefix is its own series, as in eeschema: `#FLG01` and `#PWR01` sit
+/// on one sheet (#146).
 ///
 /// Counting the power symbols instead re-issues a live designator after a
 /// deletion: drop `#PWR028` from a sheet of 29 and the count is 28, so the
 /// next symbol is handed `#PWR029` — still in use, silently duplicated.
-fn next_pwr_number(sch: &cse::Schematic) -> u32 {
+fn next_power_number(sch: &cse::Schematic, prefix: &str) -> u32 {
     let used: std::collections::HashSet<u32> = sch
         .symbols
         .iter()
         .filter_map(|s| s.reference())
-        .filter_map(|r| r.strip_prefix("#PWR"))
+        .filter_map(|r| r.strip_prefix(prefix))
         .filter_map(|n| n.parse::<u32>().ok())
         .collect();
     (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
@@ -2143,11 +2154,6 @@ async fn handle_add_power_symbol(
         return Ok(error.into_tool_result());
     }
 
-    // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
-    // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
-    // same number beside every eeschema-numbered symbol (#583).
-    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(&sch));
-
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
     let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
@@ -2160,6 +2166,17 @@ async fn handle_add_power_symbol(
     let metadata = cse::library::symbol_metadata(&sch, &lib_id);
     let placement_fields =
         super::sch_components::PlacementFields::resolve(&lib_id, &metadata, Some(&power_net), None);
+
+    // The prefix is the library's, as for any other placed symbol: `#PWR` for
+    // a rail, `#FLG` for `PWR_FLAG`, which eeschema numbers as its own series
+    // (#146). Spelled by the rule `annotate_schematic` uses, which is
+    // eeschema's: `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second
+    // spelling of the same number beside every eeschema-numbered symbol (#583).
+    let prefix = match metadata.reference.trim() {
+        "" => DEFAULT_POWER_PREFIX,
+        prefix => prefix,
+    };
+    let pwr_ref = super::sch_annotate::format_designator(prefix, next_power_number(&sch, prefix));
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -2496,6 +2513,14 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    // The schema says `minimum: 0`, but a direct caller is not held to it. A
+    // negative stub would run back into the symbol body (#186).
+    if stub_length < 0.0 {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be 0 or greater; 0 puts the label on the pin with no wire",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -2564,17 +2589,25 @@ async fn handle_connect_to_net(
 
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
-    })))
+    });
+    // Reported only when written, as batch_connect_to_net does: a zero-length
+    // stub is a label on the pin and no wire (#186).
+    if stub_length > 0.0 {
+        body["wire"] = json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y });
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 /// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
 /// with the junctions it needs, and a net or global label at its end. Returns
 /// the label's position and rotation.
+///
+/// A `stub_length` of 0 draws no wire and puts the label on the pin: a wire
+/// whose two ends are one point connects nothing (#186).
 pub(crate) fn add_net_stub(
     sch: &mut cse::Schematic,
     pins: &[(f64, f64)],
@@ -2585,7 +2618,9 @@ pub(crate) fn add_net_stub(
     net: &str,
 ) -> (f64, f64, f64) {
     let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, pins, pin, end);
+    if stub_length > 0.0 {
+        add_stub_wire(sch, pins, pin, end);
+    }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
 }
@@ -3482,6 +3517,108 @@ mod unit_aware_wiring_tests {
             other => panic!("expected text content, got {other:?}"),
         };
         assert!(text.contains("units 1, 2"), "{text}");
+    }
+
+    /// The response body of a `connect_to_net` call that must succeed.
+    async fn connect_to_net_body(
+        path: &std::path::Path,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut full = json!({ "schematic": path.display().to_string() });
+        for (k, v) in args.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        let result = handle_connect_to_net(&full, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn near(value: &serde_json::Value, expected: f64) -> bool {
+        value.as_f64().is_some_and(|v| (v - expected).abs() < 1e-6)
+    }
+
+    /// #186: `stub_length: 0` used to write a wire from the pin to itself.
+    /// It now writes no wire and puts the label on the pin, as
+    /// `batch_connect_to_net` does, and reports no `wire`.
+    #[tokio::test]
+    async fn a_zero_stub_writes_no_wire_and_labels_the_pin() {
+        let (_d, path) = dual_opamp_schematic();
+        let wires_before = cse::Schematic::load(&path).unwrap().wires.len();
+
+        let body = connect_to_net_body(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN", "stub_length": 0 }),
+        )
+        .await;
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.wires.len(), wires_before, "no wire is written");
+        // Pin 1's tip; a 2.54 mm stub would have put the label at 89.84.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 92.38 77.46 180)"), "{after}");
+        assert!(body.get("wire").is_none(), "no wire was written: {body}");
+        assert!(near(&body["label"]["x"], 92.38), "{body}");
+        assert!(near(&body["label"]["y"], 77.46), "{body}");
+    }
+
+    /// A negative length is refused as `invalid_argument` and writes nothing.
+    #[tokio::test]
+    async fn a_negative_stub_is_refused_and_the_file_is_unchanged() {
+        let (_d, path) = dual_opamp_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_connect_to_net(
+            &json!({ "schematic": path.display().to_string(),
+                     "reference": "U1", "pin_number": "1", "net": "IN",
+                     "stub_length": -2.54 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// A positive length is unchanged: one wire from the pin to the label.
+    #[tokio::test]
+    async fn a_positive_stub_still_writes_its_wire() {
+        let (_d, path) = dual_opamp_schematic();
+        let wires_before = cse::Schematic::load(&path).unwrap().wires.len();
+
+        let body = connect_to_net_body(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN" }),
+        )
+        .await;
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.wires.len(), wires_before + 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 89.84 77.46 180)"), "{after}");
+        assert!(near(&body["wire"]["x1"], 92.38), "{body}");
+        assert!(near(&body["wire"]["x2"], 89.84), "{body}");
+        assert!(near(&body["label"]["x"], 89.84), "{body}");
+    }
+
+    #[test]
+    fn the_schema_refuses_a_negative_stub() {
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "connect_to_net")
+            .unwrap();
+        let args =
+            |stub: f64| json!({ "schematic": "s.kicad_sch", "net": "N", "stub_length": stub });
+        assert!(def.input_validator.is_valid(&args(0.0)));
+        assert!(def.input_validator.is_valid(&args(2.54)));
+        assert!(!def.input_validator.is_valid(&args(-1.0)));
     }
 
     #[tokio::test]
@@ -4446,6 +4583,80 @@ mod power_symbol_tests {
             !sch.symbols.iter().any(|s| s.reference() == Some("#PWR100")),
             "and not the old one"
         );
+    }
+
+    /// A fresh sheet embedding `power:GND` and `power:PWR_FLAG` with the
+    /// Reference prefixes KiCad 10's `power.kicad_sym` gives them, and a
+    /// `power:BARE` whose definition names no prefix at all.
+    fn sheet_with_flag_and_gnd(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("flag.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\" (at 0 1.905 0))\n      (property \"Value\" \"PWR_FLAG\" (at 0 3.81 0))\n    )\n    (symbol \"power:BARE\"\n      (property \"Reference\" \"\" (at 0 1.905 0))\n      (property \"Value\" \"BARE\" (at 0 3.81 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+        path
+    }
+
+    /// Place `power:<power_net>` and return the designator the tool reported.
+    async fn add_power(path: &std::path::Path, power_net: &str, x: f64) -> String {
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": power_net,
+                "x": x,
+                "y": 25.4
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body: serde_json::Value = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected a JSON text response, got {other:?}"),
+        };
+        body["reference"].as_str().unwrap().to_string()
+    }
+
+    /// #146: `PWR_FLAG` was numbered `#PWR01` from a hard-coded prefix. Its
+    /// library Reference is `#FLG`, and eeschema numbers that series apart
+    /// from `#PWR`.
+    #[tokio::test]
+    async fn pwr_flag_is_numbered_under_the_librarys_flg_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet_with_flag_and_gnd(dir.path());
+
+        assert_eq!(add_power(&path, "PWR_FLAG", 25.4).await, "#FLG01");
+        assert_eq!(add_power(&path, "GND", 38.1).await, "#PWR01");
+        assert_eq!(add_power(&path, "PWR_FLAG", 50.8).await, "#FLG02");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for designator in ["#FLG01", "#PWR01", "#FLG02"] {
+            assert_eq!(
+                designator_spellings(&after, designator),
+                (1, 1),
+                "{designator} is written once as the property and once in the instance record"
+            );
+        }
+        let sch = cse::Schematic::load(&path).unwrap();
+        let flag = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#FLG01"))
+            .expect("the flag is on the sheet");
+        assert_eq!(flag.lib_id, "power:PWR_FLAG");
+    }
+
+    /// A definition with an empty Reference falls back to `#PWR`, and shares
+    /// that series with the rails already on the sheet.
+    #[tokio::test]
+    async fn a_library_symbol_without_a_prefix_falls_back_to_pwr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet_with_flag_and_gnd(dir.path());
+
+        assert_eq!(add_power(&path, "GND", 25.4).await, "#PWR01");
+        assert_eq!(add_power(&path, "BARE", 38.1).await, "#PWR02");
     }
 
     /// A sheet that already holds Konnect's older `#PWR001` and `#PWR002`

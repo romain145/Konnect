@@ -368,7 +368,7 @@ async fn handle_export_manufacturing_package(
                 Ok(()) => {
                     let parsed = if is_jlcpcb {
                         let source = tokio::fs::read_to_string(&bom_path).await?;
-                        jlcpcb_bom_designators(&source).map(Some)
+                        jlcpcb_bom_designators(&source, cpl_designators.as_ref()).map(Some)
                     } else {
                         Ok(None)
                     };
@@ -940,7 +940,35 @@ fn jlcpcb_cpl_from_kicad_csv(
     })
 }
 
-fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
+/// Whether `designator` has the shape of a KiCad reference range, `C1-C3`:
+/// the same prefix on both sides of one hyphen and an ascending number.
+fn looks_like_reference_range(designator: &str) -> bool {
+    fn split_reference(reference: &str) -> Option<(&str, u64)> {
+        let prefix = reference.trim_end_matches(|c: char| c.is_ascii_digit());
+        if prefix.is_empty() || prefix.len() == reference.len() {
+            return None;
+        }
+        Some((prefix, reference[prefix.len()..].parse().ok()?))
+    }
+    designator.match_indices('-').any(|(at, _)| {
+        match (
+            split_reference(&designator[..at]),
+            split_reference(&designator[at + 1..]),
+        ) {
+            (Some((first_prefix, first)), Some((last_prefix, last))) => {
+                first_prefix == last_prefix && first < last
+            }
+            _ => false,
+        }
+    })
+}
+
+/// `known_references` are the references of the position file exported for the
+/// same package, when that export succeeded.
+fn jlcpcb_bom_designators(
+    source: &str,
+    known_references: Option<&BTreeSet<String>>,
+) -> anyhow::Result<BTreeSet<String>> {
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_reader(source.as_bytes());
@@ -958,7 +986,10 @@ fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
             .filter(|value| !value.is_empty())
             .context("JLCPCB BOM contains an empty designator group")?;
         for designator in group.split(',').map(str::trim) {
-            if designator.contains('-') {
+            // KiCad allows '-' inside a reference (`SMB-19-A1`), so a hyphen alone
+            // is not a range (#161): only `C1-C3` that is not a placed part is.
+            let is_known = known_references.is_some_and(|known| known.contains(designator));
+            if !is_known && looks_like_reference_range(designator) {
                 bail!(
                     "JLCPCB BOM contains compressed designator range '{designator}'; pass an empty KiCad reference-range delimiter"
                 );
@@ -1673,7 +1704,7 @@ mod jlcpcb_assembly_tests {
     #[test]
     fn fully_enumerated_bom_groups_match_individual_cpl_rows() {
         let bom = "\"Designator\",\"Comment\",\"Footprint\",\"LCSC Part #\"\n\"C1,C2,C3\",\"100nF\",\"C_0402\",\"C1525\"\n\"R1\",\"10k\",\"R_0402\",\"C25744\"\n";
-        let bom_refs = jlcpcb_bom_designators(bom).unwrap();
+        let bom_refs = jlcpcb_bom_designators(bom, None).unwrap();
         let cpl_refs = ["C1", "C2", "C3", "R1"]
             .into_iter()
             .map(str::to_string)
@@ -1684,16 +1715,76 @@ mod jlcpcb_assembly_tests {
     #[test]
     fn compressed_ranges_and_cross_file_mismatches_fail_closed() {
         let ranged = "Designator,Comment\nC1-C3,100nF\n";
-        assert!(jlcpcb_bom_designators(ranged)
+        assert!(jlcpcb_bom_designators(ranged, None)
             .unwrap_err()
             .to_string()
             .contains("compressed designator range"));
+        // A position file that does not hold the token as one part changes nothing.
+        let placed = ["C1", "C2", "C3"].into_iter().map(str::to_string).collect();
+        assert!(jlcpcb_bom_designators(ranged, Some(&placed))
+            .unwrap_err()
+            .to_string()
+            .contains("compressed designator range"));
+        let grouped = "Designator,Comment\n\"R1,C1-C3\",100nF\n";
+        assert!(jlcpcb_bom_designators(grouped, None)
+            .unwrap_err()
+            .to_string()
+            .contains("'C1-C3'"));
 
         let cpl = ["C1", "C2", "U1"].into_iter().map(str::to_string).collect();
         let bom = ["C1", "C2", "R1"].into_iter().map(str::to_string).collect();
         let mismatch = jlcpcb_designator_mismatch(&cpl, &bom).unwrap();
         assert!(mismatch.contains("missing from BOM [U1]"));
         assert!(mismatch.contains("missing from CPL [R1]"));
+    }
+
+    #[test]
+    fn a_reference_containing_a_hyphen_is_one_designator() {
+        let expected: BTreeSet<String> = ["R1", "SMB-19-A1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let bom = "\"Refs\",\"Value\"\n\"SMB-19-A1\",\"clip\"\n\"R1\",\"10k\"\n";
+        assert_eq!(jlcpcb_bom_designators(bom, None).unwrap(), expected);
+        assert_eq!(
+            jlcpcb_bom_designators(bom, Some(&expected)).unwrap(),
+            expected
+        );
+
+        let grouped = "\"Refs\",\"Value\"\n\"R1,R2,SMB-19-A1\",\"mixed\"\n";
+        let refs = jlcpcb_bom_designators(grouped, None).unwrap();
+        assert_eq!(
+            refs.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["R1", "R2", "SMB-19-A1"]
+        );
+    }
+
+    #[test]
+    fn a_range_shaped_reference_is_accepted_only_when_it_is_a_placed_part() {
+        let bom = "Designator,Comment\nJ1-J2,bridge\n";
+        let placed: BTreeSet<String> = ["J1-J2".to_string()].into_iter().collect();
+        assert_eq!(jlcpcb_bom_designators(bom, Some(&placed)).unwrap(), placed);
+        assert!(jlcpcb_bom_designators(bom, None).is_err());
+    }
+
+    #[test]
+    fn only_same_prefix_ascending_numbers_look_like_a_range() {
+        for range in ["C1-C3", "R10-R12", "TP1-TP4"] {
+            assert!(looks_like_reference_range(range), "{range}");
+        }
+        for reference in [
+            "SMB-19-A1",
+            "R1",
+            "C3-C1",
+            "C1-R3",
+            "J-1",
+            "1-3",
+            "C1-",
+            "-C1",
+        ] {
+            assert!(!looks_like_reference_range(reference), "{reference}");
+        }
     }
 
     /// This is an output-level test of KiCad's range switch, not merely an
@@ -1736,7 +1827,7 @@ mod jlcpcb_assembly_tests {
             .await
             .unwrap();
         let ranged_source = tokio::fs::read_to_string(&ranged).await.unwrap();
-        let ranged_refs = jlcpcb_bom_designators(&ranged_source).unwrap_err();
+        let ranged_refs = jlcpcb_bom_designators(&ranged_source, None).unwrap_err();
         assert!(ranged_refs
             .to_string()
             .contains("compressed designator range"));
@@ -1778,7 +1869,7 @@ mod jlcpcb_assembly_tests {
             .await
             .unwrap();
         let bom_source = tokio::fs::read_to_string(&bom).await.unwrap();
-        let bom_refs = jlcpcb_bom_designators(&bom_source).unwrap();
+        let bom_refs = jlcpcb_bom_designators(&bom_source, None).unwrap();
         assert_eq!(
             jlcpcb_designator_mismatch(&cpl_export.designators, &bom_refs),
             None

@@ -57,24 +57,69 @@ pub(crate) fn optional_string_array(
         .collect()
 }
 
+/// The board's declared layers that `keep` selects, in layer-table order.
+fn declared_layers(
+    board_source: &str,
+    keep: fn(&konnect_sexp::layers::Layer) -> bool,
+) -> anyhow::Result<Vec<String>> {
+    let board = konnect_sexp::parser::parse_sexp(board_source)?;
+    let declared = konnect_sexp::layers::layers(&board);
+    if declared.is_empty() {
+        anyhow::bail!("board has no (layers) table");
+    }
+    Ok(declared
+        .into_iter()
+        .filter(keep)
+        .map(|layer| layer.name)
+        .collect())
+}
+
+/// `default` applied to the board at `board`, for a call that names no layers.
+async fn default_layers(
+    board: &Path,
+    default: fn(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    let source = tokio::fs::read_to_string(board)
+        .await
+        .with_context(|| format!("cannot read board {}", board.display()))?;
+    default(&source)
+}
+
 /// Default Gerber selection for a fabrication package: every enabled copper
 /// layer plus solder mask, silkscreen, and the board outline. It deliberately
 /// excludes drawings, comments, adhesive, courtyard, fab, and margin layers.
 pub(crate) fn standard_gerber_layers(board_source: &str) -> anyhow::Result<Vec<String>> {
-    let board = konnect_sexp::parser::parse_sexp(board_source)?;
-    let layers = konnect_sexp::layers::layers(&board)
-        .into_iter()
-        .filter(|layer| {
-            layer.is_copper()
-                || matches!(
-                    layer.name.as_str(),
-                    "F.Mask" | "B.Mask" | "F.SilkS" | "B.SilkS" | "Edge.Cuts"
-                )
-        })
-        .map(|layer| layer.name)
-        .collect::<Vec<_>>();
+    let layers = declared_layers(board_source, |layer| {
+        layer.is_copper()
+            || matches!(
+                layer.name.as_str(),
+                "F.Mask" | "B.Mask" | "F.SilkS" | "B.SilkS" | "Edge.Cuts"
+            )
+    })?;
     if layers.is_empty() {
         anyhow::bail!("board declares no standard fabrication layers");
+    }
+    Ok(layers)
+}
+
+/// The front view, bottom to top: `kicad-cli` draws a single-page plot in
+/// `--layers` order, so the silkscreen goes over the mask openings.
+const FRONT_VIEW: [&str; 4] = ["F.Cu", "F.Mask", "F.SilkS", "Edge.Cuts"];
+
+/// Default selection for a single-page PDF or SVG: the board seen from the
+/// front. `kicad-cli` needs at least one layer and has no "visible layers"
+/// option, and stacking every copper layer on one page is unreadable.
+pub(crate) fn front_view_layers(board_source: &str) -> anyhow::Result<Vec<String>> {
+    let declared = declared_layers(board_source, |layer| {
+        FRONT_VIEW.contains(&layer.name.as_str())
+    })?;
+    let layers = FRONT_VIEW
+        .into_iter()
+        .filter(|name| declared.iter().any(|layer| layer == name))
+        .map(String::from)
+        .collect::<Vec<_>>();
+    if layers.is_empty() {
+        anyhow::bail!("board declares none of {}", FRONT_VIEW.join(", "));
     }
     Ok(layers)
 }
@@ -143,7 +188,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output PDF file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Exact layer names to plot on one page. Omit or pass an empty array for the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -162,7 +207,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output SVG file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Exact layer names to plot on one page. Omit or pass an empty array for the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -232,15 +277,19 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_netlist",
-            "Export the PCB netlist to a file in KiCAD or IPC-D-356 format.",
+            "Export a netlist file. format 'ipc' writes the board's IPC-D-356 netlist \
+             (kicad-cli `pcb export ipcd356`). format 'kicad' writes a KiCAD netlist, which \
+             kicad-cli can only produce from the schematic: given a .kicad_pcb it is exported \
+             from the root schematic of the same name beside the board (reported as \
+             `source_schematic`), and refused when that schematic does not exist.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (or .kicad_sch for schematic netlist)" },
+                    "board": { "type": "string", "description": "Path to the .kicad_pcb file. For format 'kicad' the netlist comes from the <board name>.kicad_sch beside it; a .kicad_sch path is also accepted directly." },
                     "output": { "type": "string", "description": "Output netlist file path" },
                     "format": {
                         "type": "string",
-                        "description": "Netlist format: 'kicad' or 'ipc' (IPC-D-356)",
+                        "description": "Netlist format: 'kicad' (from the schematic) or 'ipc' (IPC-D-356, from the board)",
                         "default": "kicad"
                     }
                 },
@@ -434,16 +483,13 @@ async fn handle_export_gerber(
     let output_dir = get_path(args, "output_dir")?;
     let drill = args["drill_file"].as_bool().unwrap_or(true);
 
-    let requested_layers = match optional_string_array(args, "layers") {
+    let mut layers = match optional_string_array(args, "layers") {
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
-    let layers = if requested_layers.is_empty() {
-        let board_source = tokio::fs::read_to_string(&board).await?;
-        standard_gerber_layers(&board_source)?
-    } else {
-        requested_layers
-    };
+    if layers.is_empty() {
+        layers = default_layers(&board, standard_gerber_layers).await?;
+    }
     let layer_refs = layers.iter().map(String::as_str).collect::<Vec<_>>();
 
     // Ensure output dir exists
@@ -489,15 +535,13 @@ async fn handle_export_pdf(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    // Collect optional layer list
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut layers = match optional_string_array(args, "layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    if layers.is_empty() {
+        layers = default_layers(&board, front_view_layers).await?;
+    }
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -508,6 +552,7 @@ async fn handle_export_pdf(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -521,14 +566,13 @@ async fn handle_export_svg(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut layers = match optional_string_array(args, "layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    if layers.is_empty() {
+        layers = default_layers(&board, front_view_layers).await?;
+    }
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -539,6 +583,7 @@ async fn handle_export_svg(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -617,18 +662,79 @@ async fn handle_export_netlist(
     let output = get_path(args, "output")?;
     let format = args["format"].as_str().unwrap_or("kicad");
 
+    let source = match netlist_source(&board, format) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
+
     let cli = &ctx.config.kicad_cli;
-    // kicad-cli `sch export netlist` works on both .kicad_sch and .kicad_pcb paths.
-    // For PCB-specific netlist formats (IPC-D-356), delegate same way.
-    cli::export_netlist(cli, &board, &output, format).await?;
+    let mut response = json!({
+        "success": true,
+        "format": format,
+        "output": output.to_str().unwrap_or("")
+    });
+    match &source {
+        NetlistSource::Board(board) => cli::export_ipcd356(cli, board, &output).await?,
+        NetlistSource::Schematic(schematic) => {
+            cli::export_netlist(cli, schematic, &output, format).await?;
+            response["source_schematic"] = json!(schematic.to_str().unwrap_or(""));
+        }
+    }
 
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
+        serde_json::to_string(&response).unwrap(),
+    ))
+}
+
+/// The file `export_netlist` hands to kicad-cli.
+#[derive(Debug, PartialEq)]
+enum NetlistSource {
+    /// `pcb export ipcd356` on the board.
+    Board(PathBuf),
+    /// `sch export netlist` on a schematic.
+    Schematic(PathBuf),
+}
+
+/// The names `export_netlist` takes for IPC-D-356.
+fn is_ipcd356_format(format: &str) -> bool {
+    matches!(
+        format.to_ascii_lowercase().as_str(),
+        "ipc" | "ipcd356" | "ipc-d-356" | "ipc_d_356" | "d356"
+    )
+}
+
+/// Which file a netlist in `format` is exported from, given the `board`
+/// argument. kicad-cli has two unrelated commands: `pcb export ipcd356` reads
+/// a board, and `sch export netlist` reads a schematic, does not load a
+/// `.kicad_pcb` and has no IPC-D-356 format (#199). So every format but
+/// IPC-D-356 needs the schematic, which for a board path is the root schematic
+/// KiCad keeps beside it under the same name.
+fn netlist_source(input: &Path, format: &str) -> Result<NetlistSource, CallToolResult> {
+    let is_board = extension_is(input, "kicad_pcb");
+    if is_ipcd356_format(format) {
+        if extension_is(input, "kicad_sch") {
+            return Err(invalid_export_argument(
+                "board",
+                "an IPC-D-356 netlist is exported from the board; pass the .kicad_pcb file",
+            ));
+        }
+        return Ok(NetlistSource::Board(input.to_path_buf()));
+    }
+    if !is_board {
+        return Ok(NetlistSource::Schematic(input.to_path_buf()));
+    }
+    let schematic = input.with_extension("kicad_sch");
+    if schematic.is_file() {
+        return Ok(NetlistSource::Schematic(schematic));
+    }
+    Err(invalid_export_argument(
+        "board",
+        format!(
+            "a '{format}' netlist is exported from the schematic, not the board, and no \
+             schematic '{}' exists beside this board; pass the root .kicad_sch file here or \
+             to generate_netlist, or use format 'ipc' for the board's IPC-D-356 netlist",
+            schematic.display()
+        ),
     ))
 }
 
@@ -1518,5 +1624,321 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+/// `export_pdf` and `export_svg` documented an omitted `layers` as "all
+/// visible layers", but sent no `--layers` at all, and `kicad-cli` refuses
+/// that with "At least one layer must be specified" (#465).
+#[cfg(test)]
+mod default_plot_layers_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    /// The promised front view, bottom layer first; restated here rather than
+    /// read from the code. `kicad-cli` 10.0.6 plots this fixture with these
+    /// layers; the inner, back and documentation layers it declares stay off.
+    const PROMISED: [&str; 4] = ["F.Cu", "F.Mask", "F.SilkS", "Edge.Cuts"];
+
+    #[test]
+    fn the_default_is_the_front_view_of_a_kicad_board() {
+        let board = include_str!("../../tests/fixtures/six_layer_power_planes_kicad10.kicad_pcb");
+        assert_eq!(front_view_layers(board).unwrap(), PROMISED);
+    }
+
+    /// Calls `tool` through the served dispatch with a fake `kicad-cli` that
+    /// records its command line and writes the file named by `--output`.
+    async fn export(tool: &str, layers: Option<Value>) -> (Value, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/six_layer_power_planes_kicad10.kicad_pcb"
+            ),
+            &board,
+        )
+        .unwrap();
+        let recorded = dir.path().join("argv.txt");
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --output ] && printf x > \"$2\"; shift; done\n",
+                recorded.display()
+            ),
+            &format!(
+                "@echo off\r\necho %* > \"{}\"\r\n\
+                 :next\r\nif \"%~1\"==\"--output\" (echo x> \"%~2\")\r\n\
+                 shift\r\nif not \"%~1\"==\"\" goto next\r\nexit /b 0\r\n",
+                recorded.display()
+            ),
+        );
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut args = json!({
+            "board": board.display().to_string(),
+            "output": dir.path().join(tool.replace("export_", "out.")).display().to_string(),
+        });
+        if let Some(layers) = layers {
+            args["layers"] = layers;
+        }
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 465, "method": "tools/call",
+                "params": {"name": tool, "arguments": args}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_ne!(result["isError"], true, "{tool}: {text}");
+        let body = serde_json::from_str(text).unwrap();
+        // Windows quotes batch-file arguments that hold a comma.
+        let argv = std::fs::read_to_string(&recorded).unwrap().replace('"', "");
+        (body, argv)
+    }
+
+    #[tokio::test]
+    async fn an_omitted_or_empty_layer_list_plots_the_front_view() {
+        for tool in ["export_pdf", "export_svg"] {
+            for layers in [None, Some(json!([]))] {
+                let (body, argv) = export(tool, layers.clone()).await;
+                assert!(
+                    argv.contains("--layers F.Cu,F.Mask,F.SilkS,Edge.Cuts"),
+                    "{tool} {layers:?}: {argv}"
+                );
+                assert_eq!(body["layers"], json!(PROMISED), "{tool} {layers:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_layer_list_is_plotted_as_given() {
+        for tool in ["export_pdf", "export_svg"] {
+            let (body, argv) = export(tool, Some(json!(["B.Cu", "Edge.Cuts"]))).await;
+            assert!(argv.contains("--layers B.Cu,Edge.Cuts"), "{tool}: {argv}");
+            assert_eq!(body["layers"], json!(["B.Cu", "Edge.Cuts"]), "{tool}");
+        }
+    }
+
+    /// The default reads the board before `kicad-cli` runs, so a board that
+    /// is not there must still be named in the error.
+    #[tokio::test]
+    async fn a_missing_board_is_named_when_the_default_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("missing.kicad_pcb");
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let error = handle_export_svg(
+            &json!({
+                "board": board.display().to_string(),
+                "output": dir.path().join("out.svg").display().to_string(),
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an unreadable board fails before kicad-cli runs");
+        assert!(
+            format!("{error:#}").contains(&board.display().to_string()),
+            "{error:#}"
+        );
+    }
+}
+
+/// `export_netlist` ran `sch export netlist` on the board whatever the format.
+/// That command does not load a `.kicad_pcb` ("Failed to load schematic") and
+/// has no IPC-D-356 format ("Invalid format"), so neither format worked (#199).
+#[cfg(test)]
+mod netlist_export_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    struct Run {
+        dir: tempfile::TempDir,
+        result: Value,
+        /// The fake `kicad-cli` command line, or `None` when it never ran.
+        argv: Option<String>,
+    }
+
+    impl Run {
+        fn path(&self, name: &str) -> String {
+            self.dir.path().join(name).display().to_string()
+        }
+
+        fn body(&self) -> Value {
+            serde_json::from_str(self.result["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+    }
+
+    /// Calls `export_netlist` on `input` through the served dispatch, in a
+    /// directory holding `files`, with a fake `kicad-cli` that records its
+    /// command line and writes the file named by `--output`.
+    async fn export(files: &[&str], input: &str, format: Option<&str>) -> Run {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        let recorded = dir.path().join("argv.txt");
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --output ] && printf x > \"$2\"; shift; done\n",
+                recorded.display()
+            ),
+            &format!(
+                "@echo off\r\necho %* > \"{}\"\r\n\
+                 :next\r\nif \"%~1\"==\"--output\" (echo x> \"%~2\")\r\n\
+                 shift\r\nif not \"%~1\"==\"\" goto next\r\nexit /b 0\r\n",
+                recorded.display()
+            ),
+        );
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut args = json!({
+            "board": dir.path().join(input).display().to_string(),
+            "output": dir.path().join("out.net").display().to_string(),
+        });
+        if let Some(format) = format {
+            args["format"] = json!(format);
+        }
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 199, "method": "tools/call",
+                "params": {"name": "export_netlist", "arguments": args}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        // Windows quotes batch-file arguments that hold a space.
+        let argv = std::fs::read_to_string(&recorded)
+            .ok()
+            .map(|argv| argv.replace('"', "").trim().to_string());
+        Run { dir, result, argv }
+    }
+
+    #[tokio::test]
+    async fn ipc_runs_pcb_export_ipcd356_on_the_board() {
+        for format in ["ipc", "IPC", "ipcd356", "IPC-D-356"] {
+            // A schematic beside the board must not divert a board export.
+            let run = export(
+                &["demo.kicad_pcb", "demo.kicad_sch"],
+                "demo.kicad_pcb",
+                Some(format),
+            )
+            .await;
+            assert_ne!(run.result["isError"], true, "{format}: {}", run.result);
+            let expected = format!(
+                "pcb export ipcd356 --output {} {}",
+                run.path("out.net"),
+                run.path("demo.kicad_pcb")
+            );
+            assert_eq!(run.argv.as_deref(), Some(expected.as_str()), "{format}");
+            let body = run.body();
+            assert_eq!(body["format"], format);
+            assert!(body.get("source_schematic").is_none(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kicad_exports_from_the_schematic_beside_the_board() {
+        for format in [None, Some("kicad")] {
+            let run = export(
+                &["demo.kicad_pcb", "demo.kicad_sch"],
+                "demo.kicad_pcb",
+                format,
+            )
+            .await;
+            assert_ne!(run.result["isError"], true, "{format:?}: {}", run.result);
+            let expected = format!(
+                "sch export netlist --output {} --format kicadsexpr {}",
+                run.path("out.net"),
+                run.path("demo.kicad_sch")
+            );
+            assert_eq!(run.argv.as_deref(), Some(expected.as_str()), "{format:?}");
+            assert_eq!(
+                run.body()["source_schematic"],
+                run.path("demo.kicad_sch"),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kicad_without_a_schematic_is_refused_before_kicad_cli_runs() {
+        let run = export(&["demo.kicad_pcb"], "demo.kicad_pcb", Some("kicad")).await;
+
+        assert_eq!(run.result["isError"], true, "{}", run.result);
+        let body = run.body();
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "board");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("exported from the schematic"), "{message}");
+        assert!(message.contains("generate_netlist"), "{message}");
+        assert!(message.contains(&run.path("demo.kicad_sch")), "{message}");
+        assert_eq!(run.argv, None, "kicad-cli must not run");
+        assert!(!run.dir.path().join("out.net").exists());
+    }
+
+    #[tokio::test]
+    async fn a_schematic_path_still_exports_its_netlist() {
+        let run = export(&["demo.kicad_sch"], "demo.kicad_sch", Some("kicad")).await;
+
+        assert_ne!(run.result["isError"], true, "{}", run.result);
+        let argv = run.argv.as_deref().unwrap();
+        assert!(argv.starts_with("sch export netlist "), "{argv}");
+        assert!(argv.ends_with(&run.path("demo.kicad_sch")), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn ipc_from_a_schematic_path_is_refused() {
+        let run = export(&["demo.kicad_sch"], "demo.kicad_sch", Some("ipc")).await;
+
+        assert_eq!(run.result["isError"], true, "{}", run.result);
+        assert_eq!(run.body()["error"]["field"], "board");
+        assert_eq!(run.argv, None, "kicad-cli must not run");
+        assert!(!run.dir.path().join("out.net").exists());
+    }
+
+    #[test]
+    fn the_source_follows_the_format_and_the_files_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        let schematic = dir.path().join("demo.kicad_sch");
+
+        assert_eq!(
+            netlist_source(&board, "ipc").ok(),
+            Some(NetlistSource::Board(board.clone()))
+        );
+        assert!(netlist_source(&board, "kicad").is_err());
+        // Every schematic netlist format needs the schematic, not only 'kicad'.
+        assert!(netlist_source(&board, "spice").is_err());
+
+        std::fs::write(&schematic, "").unwrap();
+        assert_eq!(
+            netlist_source(&board, "kicad").ok(),
+            Some(NetlistSource::Schematic(schematic.clone()))
+        );
+        assert_eq!(
+            netlist_source(&schematic, "kicad").ok(),
+            Some(NetlistSource::Schematic(schematic))
+        );
     }
 }

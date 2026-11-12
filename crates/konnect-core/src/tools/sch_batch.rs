@@ -13,10 +13,11 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{points_coincident, snap_point},
+    geometry::{points_coincident, round6, snap_point},
+    parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, parse_at, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
@@ -152,14 +153,14 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
-             or component reference designator — single file write.",
+             (`uuids`) or component reference designator (`references`) — single file write.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "uuids": {
                         "type": "array",
-                        "description": "UUIDs of items to delete",
+                        "description": "UUIDs of items to delete. Reference designators go in references.",
                         "items": { "type": "string" }
                     },
                     "references": {
@@ -1368,7 +1369,13 @@ async fn handle_structural_batch_delete(
                     continue;
                 };
                 let Some(item) = indexed.get(uuid) else {
-                    errors.push(format!("UUID '{}' not found", uuid));
+                    let mut error = format!("UUID '{uuid}' not found");
+                    // A reference also passed in `references` was found there.
+                    if available_references.contains(uuid) && !seen_references.contains(uuid) {
+                        error +=
+                            &format!("; '{uuid}' is a component reference, pass it in references");
+                    }
+                    errors.push(error);
                     continue;
                 };
                 if !is_deletable_schematic_tag(&item.kind) {
@@ -1698,8 +1705,20 @@ async fn handle_add_schematic_text(
         .replace('\n', "\\n")
         .replace('\t', "\\t");
 
+    // Rounded to the six decimals KiCad writes: a caller passing back a
+    // coordinate an older response reported (54.60999999999999, #747) would
+    // otherwise write that noise into the file (#828).
+    let at = [round6(x), round6(y), round6(rotation)];
+    // Rounding scales by 1e6, so a value near f64::MAX becomes `inf`, which
+    // KiCad cannot load.
+    for (field, value) in ["x", "y", "rotation"].into_iter().zip(at) {
+        if !value.is_finite() {
+            return Ok(invalid_arg(field, "must be a finite number of millimetres"));
+        }
+    }
+    let [at_x, at_y, at_rotation] = at;
     let text_sexp = format!(
-        "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
+        "\n  (text \"{escaped}\"\n    (at {at_x} {at_y} {at_rotation})\n    \
          (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )"
     );
 
@@ -1711,6 +1730,17 @@ async fn handle_add_schematic_text(
     let new_content = crate::tools::sch_wiring::insert_before_close(&content, &text_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
+    let landed = read_consistent(&sch_path)
+        .map_err(|e| format!("the saved schematic could not be re-read: {e}"))
+        .and_then(|content| text_landed(&content, &uuid, at));
+    if let Err(reason) = landed {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "add_schematic_text",
+            reason,
+        ));
+    }
+
     Ok(CallToolResult::json(&json!({
         "added": text,
         "x": x, "y": y,
@@ -1720,6 +1750,24 @@ async fn handle_add_schematic_text(
         "font": font_sexp,
         "uuid": uuid
     })))
+}
+
+/// Confirm `content` holds the text `uuid` at its own `(at x y rotation)`, or
+/// say why not.
+fn text_landed(content: &str, uuid: &str, at: [f64; 3]) -> Result<(), String> {
+    let tree =
+        parse_sexp(content).map_err(|e| format!("the saved schematic cannot be parsed: {e}"))?;
+    let written = tree
+        .find_all("text")
+        .into_iter()
+        .find(|text| text.find_str("uuid") == Some(uuid))
+        .ok_or_else(|| format!("the saved schematic has no text {uuid}"))?;
+    match parse_at(written) {
+        Some((x, y, rotation)) if [x, y, rotation] == at => Ok(()),
+        found => Err(format!(
+            "text {uuid} is at {found:?} in the saved schematic, not at {at:?}"
+        )),
+    }
 }
 
 async fn handle_get_layout(
@@ -2165,6 +2213,115 @@ mod connectivity_safe_batch_delete_tests {
             assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), CONNECTIVITY);
         }
+    }
+
+    /// #954: a reference passed in `uuids` is not deleted as a component, and
+    /// its error says where references go. R1 and the wire UUID are as eeschema
+    /// wrote them in the fixture.
+    #[tokio::test]
+    async fn reference_in_uuids_names_the_references_argument() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path,
+                "uuids": ["18704fbf-0b66-4864-a63f-39e3ac9f5a5c", "R1", "MISSING"]
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(
+            response["deleted_item_uuids"],
+            json!(["18704fbf-0b66-4864-a63f-39e3ac9f5a5c"])
+        );
+        assert_eq!(
+            response["errors"],
+            json!([
+                "UUID 'R1' not found; 'R1' is a component reference, pass it in references",
+                "UUID 'MISSING' not found"
+            ])
+        );
+        let after = konnect_sexp::schematic::read_schematic(&path).unwrap().1;
+        assert!(extract_symbol_instances(&after)
+            .iter()
+            .any(|instance| instance.reference == "R1"));
+    }
+
+    /// #954 through `tools/call`: references alone in `uuids` select nothing,
+    /// so the refusal carries the hint and the file is unchanged. #PWR01 and
+    /// U1 (three units) are eeschema's designators in the ECC83 fixture.
+    /// A reference passed in both arguments is deleted, so the `uuids` miss
+    /// keeps its plain error instead of advice the caller already followed.
+    #[tokio::test]
+    async fn reference_in_both_arguments_gets_no_hint() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_batch_delete(
+            &json!({ "schematic": path, "references": ["R1"], "uuids": ["R1"] }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["deleted"], json!(["R1"]));
+        assert_eq!(response["errors"], json!(["UUID 'R1' not found"]));
+    }
+
+    #[tokio::test]
+    async fn served_reference_only_uuids_refuse_with_the_hint() {
+        let (_directory, path) = fixture(ECC83);
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 954,
+                "method": "tools/call",
+                "params": {
+                    "name": "batch_delete",
+                    "arguments": { "schematic": path, "uuids": ["#PWR01", "U1"] }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["kind"], "stale_target", "{error}");
+        for reference in ["#PWR01", "U1"] {
+            assert!(
+                text.contains(&format!(
+                    "'{reference}' is a component reference, pass it in references"
+                )),
+                "{text}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ECC83);
+    }
+
+    #[test]
+    fn batch_delete_description_names_both_selection_arguments() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "batch_delete")
+            .unwrap();
+        for argument in ["uuids", "references"] {
+            assert!(
+                tool.description.contains(argument),
+                "{argument}: {}",
+                tool.description
+            );
+        }
+        let uuids = &tool.input_schema["properties"]["uuids"]["description"];
+        assert!(uuids.as_str().unwrap().contains("references"), "{uuids}");
     }
 
     #[tokio::test]
@@ -3758,6 +3915,99 @@ mod add_text_placement_tests {
         );
         assert!(schematic_text_justify("sideways").is_err());
         assert!(schematic_text_justify("top bottom").is_err());
+    }
+
+    /// KiCad's own serialization, from `batch_connect_kicad10.README.md`.
+    const KICAD_SHEET: &str = include_str!("../../tests/fixtures/batch_connect_kicad10.kicad_sch");
+
+    /// #828 through the served dispatch. The coordinates are the float noise
+    /// older responses reported (#747); KiCad 10.0.6 resaves them, and a
+    /// rotation of `90.00000000000001`, as `(at 54.61 27.94 90)` (see the
+    /// README). Nothing else in KiCad's file changes.
+    #[tokio::test]
+    async fn the_served_dispatch_writes_the_coordinates_kicad_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.kicad_sch");
+        std::fs::write(&path, KICAD_SHEET).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 828,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_schematic_text",
+                    "arguments": {
+                        "schematic": path.display().to_string(),
+                        "text": "hi",
+                        "x": 54.60999999999999,
+                        "y": 27.939999999999998,
+                        "rotation": 90.00000000000001
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        // The response echoes the caller's values, as #807 left them.
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["x"], json!(54.60999999999999), "{body}");
+        assert_eq!(body["rotation"], json!(90.00000000000001), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let start = after.find("(text \"hi\"").expect("text written");
+        let (_, end) = konnect_sexp::writer::find_balanced_block(&after, start).unwrap();
+        assert!(
+            after[start..end].contains("(at 54.61 27.94 90)"),
+            "{}",
+            &after[start..end]
+        );
+        // The splice adds a newline and indent before the block.
+        let rest = format!("{}{}", &after[..start - "\n  ".len()], &after[end..]);
+        assert_eq!(rest, KICAD_SHEET, "KiCad's own content is unchanged");
+    }
+
+    /// `1.8e303` is finite, but rounding scales it past `f64::MAX`, and the
+    /// `inf` it becomes is not a number KiCad can load. Refused unwritten.
+    #[tokio::test]
+    async fn a_coordinate_rounding_cannot_represent_is_refused() {
+        let (out, result) = add_text_formatted("hi", json!({ "x": 1.8e303 })).await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(out, SCH, "nothing is written");
+    }
+
+    /// The readback against the file the bug wrote: the noisy `(at …)` is not
+    /// the position requested, and KiCad's resave of it is.
+    #[test]
+    fn text_landed_reads_the_written_position() {
+        let block = |at: &str| {
+            format!("(kicad_sch (text \"hi\" (at {at}) (effects (font (size 1.27 1.27))) (uuid \"t1\")))")
+        };
+        let at = [54.61, 27.94, 0.0];
+        let noisy = block("54.60999999999999 27.939999999999998 0");
+        assert!(super::text_landed(&noisy, "t1", at).is_err());
+        assert_eq!(
+            super::text_landed(&block("54.61 27.94 0"), "t1", at),
+            Ok(())
+        );
+        assert!(super::text_landed(&block("54.61 27.94 0"), "t2", at).is_err());
     }
 }
 

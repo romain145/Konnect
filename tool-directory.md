@@ -178,7 +178,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
-| `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
+| `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID (`uuids`) or component reference designator (`references`) — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
@@ -326,11 +326,11 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
-| `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
-| `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
+| `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. Without `layers`, plots the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts. |
+| `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. Without `layers`, plots the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
-| `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
+| `export_netlist` | Export a netlist file: `ipc` writes the board's IPC-D-356 netlist; `kicad` writes a KiCAD netlist from the root schematic beside the board (refused if it does not exist). |
 | `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board. The Rust exporter is the default. On KiCad 10, explicitly set `native_bridge_mode` to `prefer` or `require` for the optional authenticated ActionPlugin native exporter. Preserves locked straight tracks and through vias as fixed wiring; refuses unlocked routing, arcs, unsupported geometry, or incomplete rules. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |

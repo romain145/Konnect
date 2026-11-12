@@ -8,7 +8,7 @@ use crate::tool;
 use crate::tools::{
     get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::writer::{read_consistent, write_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -437,7 +437,7 @@ async fn handle_set_design_rules(
         return Ok(refusal);
     }
     let project_path = sibling_project_path(&board);
-    let project_content = tokio::fs::read_to_string(&project_path).await?;
+    let project_content = read_consistent(&project_path)?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
     let mut changed = Vec::new();
@@ -466,7 +466,16 @@ async fn handle_set_design_rules(
     if !changed.is_empty() {
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        // Only while the file still holds what the rules were merged into: a
+        // save in between would otherwise be replaced by the older image.
+        if let Some(conflict) = crate::tools::pcb_board::write_project_file(
+            &project_path,
+            "set_design_rules",
+            &project_content,
+            content,
+        )? {
+            return Ok(conflict);
+        }
     }
 
     Ok(CallToolResult::text(
@@ -531,7 +540,11 @@ fn project_design_settings_mut(
         })
 }
 
-fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value), CallToolResult>> {
+/// The project path, the exact text read from it (what a later write must
+/// still find there) and that text parsed.
+fn load_sibling_project(
+    board: &Path,
+) -> anyhow::Result<Result<(PathBuf, String, Value), CallToolResult>> {
     let project_path = sibling_project_path(board);
     if !project_path.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -541,9 +554,10 @@ fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value),
             project_path.display()
         ))));
     }
-    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&project_path)?)
+    let text = read_consistent(&project_path)?;
+    let settings: Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
-    Ok(Ok((project_path, settings)))
+    Ok(Ok((project_path, text, settings)))
 }
 
 fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
@@ -680,7 +694,7 @@ async fn handle_set_predefined_sizes(
         return Ok(refusal);
     }
 
-    let (project_path, mut project) = match load_sibling_project(&board)? {
+    let (project_path, project_content, mut project) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -708,7 +722,14 @@ async fn handle_set_predefined_sizes(
         settings.insert("via_dimensions".into(), via_dimensions.clone());
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(conflict) = crate::tools::pcb_board::write_project_file(
+            &project_path,
+            "set_predefined_sizes",
+            &project_content,
+            content,
+        )? {
+            return Ok(conflict);
+        }
     }
 
     Ok(CallToolResult::json(&json!({
@@ -727,7 +748,7 @@ async fn handle_get_predefined_sizes(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let (project_path, project) = match load_sibling_project(&board)? {
+    let (project_path, _, project) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1815,6 +1836,84 @@ mod tests {
                 { "diameter": 0.6, "drill": 0.3 }
             ])
         );
+    }
+
+    /// #197: both project-file writers here re-serialise the whole document.
+    /// A save landing between their read and their write must be refused as
+    /// `conflict` and kept byte for byte, not replaced by the older image.
+    /// The retry, which reads the newer file, then writes and keeps it.
+    #[tokio::test]
+    async fn a_project_file_saved_between_read_and_write_is_refused_and_kept() {
+        use crate::tools::pcb_board::board_write_hook;
+
+        /// An edit by `tool` that changes the project file.
+        async fn edit(tool: &str, board: &std::path::Path) -> CallToolResult {
+            let ctx = test_ctx();
+            let result = match tool {
+                "set_design_rules" => {
+                    let args = json!({ "board": board, "min_clearance": 0.25 });
+                    handle_set_design_rules(&args, &ctx).await
+                }
+                _ => {
+                    let args = json!({ "board": board, "track_widths": [0.2, 0.5] });
+                    handle_set_predefined_sizes(&args, &ctx).await
+                }
+            };
+            result.unwrap()
+        }
+
+        // The save in between: a netclass another writer added.
+        let newer = "{\n  \"board\": {\"design_settings\": {}},\n  \"meta\": {\"filename\": \"board.kicad_pro\", \"version\": 1},\n  \"net_settings\": {\"classes\": [{\"name\": \"HV\"}]},\n  \"schematic\": {}\n}\n";
+
+        for tool in ["set_design_rules", "set_predefined_sizes"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("board.kicad_pcb");
+            let project = dir.path().join("board.kicad_pro");
+            std::fs::write(&board, blank_board()).unwrap();
+            std::fs::write(&project, blank_project()).unwrap();
+
+            board_write_hook::set(move |path| std::fs::write(path, newer).unwrap());
+            let refused = edit(tool, &board).await;
+
+            assert!(
+                !board_write_hook::armed(),
+                "{tool} bypassed the revision-checked write"
+            );
+            assert!(
+                refused.is_error,
+                "{tool} reported success over a newer file"
+            );
+            let body: serde_json::Value = serde_json::from_str(&text_of(&refused)).unwrap();
+            assert_eq!(body["error"]["kind"], "conflict", "{tool}: {body}");
+            assert_eq!(
+                body["error"]["paths"],
+                json!([project.display().to_string()]),
+                "{tool}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&project).unwrap(),
+                newer,
+                "{tool} must leave the newer save byte for byte"
+            );
+
+            // Nothing in between this time: the write goes through, on top of
+            // the newer file.
+            let retried = edit(tool, &board).await;
+            assert!(!retried.is_error, "{tool}: {}", text_of(&retried));
+            let after = project_json(&project);
+            assert_eq!(
+                after["net_settings"]["classes"][0]["name"],
+                json!("HV"),
+                "{tool}: {after}"
+            );
+            let settings = &after["board"]["design_settings"];
+            match tool {
+                "set_design_rules" => {
+                    assert_eq!(settings["rules"]["min_clearance"], json!(0.25), "{after}")
+                }
+                _ => assert_eq!(settings["track_widths"], json!([0.0, 0.2, 0.5]), "{after}"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -1406,36 +1406,45 @@ async fn export_bom_with_options(
     Ok(())
 }
 
+/// The `sch export netlist --format` value for a friendly format name. A name
+/// this does not know is passed through lowercased for kicad-cli to judge.
+fn netlist_format(format: &str) -> String {
+    let lower = format.to_lowercase();
+    match lower.as_str() {
+        "kicad" | "kicadsexpr" | "sexp" => "kicadsexpr",
+        "xml" | "kicadxml" => "kicadxml",
+        "orcad" | "orcadpcb2" => "orcadpcb2",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Argument vector for the schematic netlist export, factored out so it can be
+/// regression-tested without a kicad-cli installation. `v10_format` comes from
+/// [`netlist_format`].
+fn netlist_args<'a>(output: &'a str, v10_format: &'a str, schematic: &'a str) -> [&'a str; 8] {
+    [
+        "sch", "export", "netlist", "--output", output, "--format", v10_format, schematic,
+    ]
+}
+
 /// KiCAD 10: `sch export netlist --output <path> --format <fmt> <input>`
 /// Valid formats: kicadsexpr, kicadxml, cadstar, orcadpcb2, spice, spicemodel, pads, allegro
+///
+/// The input must be a schematic: this command does not load a `.kicad_pcb`
+/// and has no IPC-D-356 format, which is [`export_ipcd356`] (#199).
 pub async fn export_netlist(
     cli: &str,
     schematic: &Path,
     output: &Path,
     format: &str,
 ) -> Result<()> {
-    // Map friendly names to v10 format values
-    let lower = format.to_lowercase();
-    let v10_format = match lower.as_str() {
-        "kicad" | "kicadsexpr" | "sexp" => "kicadsexpr",
-        "xml" | "kicadxml" => "kicadxml",
-        "spice" => "spice",
-        "cadstar" => "cadstar",
-        "orcad" | "orcadpcb2" => "orcadpcb2",
-        "pads" => "pads",
-        "allegro" => "allegro",
-        _ => &lower,
-    };
-    let args = [
-        "sch",
-        "export",
-        "netlist",
-        "--output",
+    let v10_format = netlist_format(format);
+    let args = netlist_args(
         output.to_str().unwrap(),
-        "--format",
-        v10_format,
+        &v10_format,
         schematic.to_str().unwrap(),
-    ];
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -1584,7 +1593,12 @@ fn single_file_pcb_export_args(
     layers: &[&str],
     black_and_white: bool,
     pcb: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
+    // kicad-cli 10 refuses a single-file plot without layers (#465).
+    anyhow::ensure!(
+        !layers.is_empty(),
+        "a PCB {format} plot needs at least one layer"
+    );
     let mut args = vec![
         "pcb".to_string(),
         "export".to_string(),
@@ -1592,19 +1606,17 @@ fn single_file_pcb_export_args(
         "--output".to_string(),
         output.to_string(),
         "--mode-single".to_string(),
+        "--layers".to_string(),
+        layers.join(","),
     ];
-    if !layers.is_empty() {
-        args.push("--layers".to_string());
-        args.push(layers.join(","));
-    }
     if black_and_white {
         args.push("--black-and-white".to_string());
     }
     args.push(pcb.to_string());
-    args
+    Ok(args)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>]
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single --layers <a,b>
 /// [--black-and-white] <input>`
 pub async fn export_pdf(
     cli: &str,
@@ -1625,14 +1637,14 @@ pub async fn export_pdf(
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
-    );
+    )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "PCB PDF").await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
+/// KiCAD 10: `pcb export svg --output <path> --mode-single --layers <a,b>
 /// [--black-and-white] <input>`
 pub async fn export_svg_pcb(
     cli: &str,
@@ -1647,7 +1659,7 @@ pub async fn export_svg_pcb(
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
-    );
+    )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
@@ -1787,16 +1799,15 @@ async fn export_position_file_with_options(
     Ok(())
 }
 
+/// Argument vector for the IPC-D-356 netlist export, factored out so it can be
+/// regression-tested without a kicad-cli installation.
+fn ipcd356_args<'a>(output: &'a str, pcb: &'a str) -> [&'a str; 6] {
+    ["pcb", "export", "ipcd356", "--output", output, pcb]
+}
+
 /// KiCAD 10: `pcb export ipcd356 --output <path> <input>`
 pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "ipcd356",
-        "--output",
-        output.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+    let args = ipcd356_args(output.to_str().unwrap(), pcb.to_str().unwrap());
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -2007,7 +2018,8 @@ mod pcb_plot_export_tests {
             &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
             false,
             "/tmp/board.kicad_pcb",
-        );
+        )
+        .unwrap();
 
         assert_eq!(args.iter().filter(|arg| *arg == "--layers").count(), 1);
         let layers = args
@@ -2018,21 +2030,29 @@ mod pcb_plot_export_tests {
     }
 
     #[test]
-    fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
+    fn file_output_uses_single_mode_and_refuses_empty_layers() {
         let args = single_file_pcb_export_args(
+            "pdf",
+            "/out/board.pdf",
+            &["F.Cu"],
+            false,
+            "/tmp/board.kicad_pcb",
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--mode-single"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
+        assert!(single_file_pcb_export_args(
             "pdf",
             "/out/board.pdf",
             &[],
             false,
             "/tmp/board.kicad_pcb",
-        );
-
-        assert!(args.iter().any(|arg| arg == "--mode-single"));
-        assert!(!args.iter().any(|arg| arg == "--layers"));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("/tmp/board.kicad_pcb")
-        );
+        )
+        .is_err());
     }
 
     #[test]
@@ -2044,8 +2064,57 @@ mod pcb_plot_export_tests {
                 &["F.Cu"],
                 true,
                 "/tmp/board.kicad_pcb",
-            );
+            )
+            .unwrap();
             assert!(args.iter().any(|argument| argument == "--black-and-white"));
+        }
+    }
+
+    /// IPC-D-356 is a board export of its own; `sch export netlist` has no
+    /// such format and does not load a board (#199).
+    #[test]
+    fn ipcd356_is_a_pcb_export_of_the_board() {
+        assert_eq!(
+            ipcd356_args("/out/board.d356", "/tmp/board.kicad_pcb"),
+            [
+                "pcb",
+                "export",
+                "ipcd356",
+                "--output",
+                "/out/board.d356",
+                "/tmp/board.kicad_pcb"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_netlist_is_a_sch_export_with_the_kicad_10_format_name() {
+        assert_eq!(
+            netlist_args(
+                "/out/board.net",
+                &netlist_format("kicad"),
+                "/tmp/board.kicad_sch"
+            ),
+            [
+                "sch",
+                "export",
+                "netlist",
+                "--output",
+                "/out/board.net",
+                "--format",
+                "kicadsexpr",
+                "/tmp/board.kicad_sch"
+            ]
+        );
+        for (friendly, v10) in [
+            ("KiCad", "kicadsexpr"),
+            ("sexp", "kicadsexpr"),
+            ("xml", "kicadxml"),
+            ("orcad", "orcadpcb2"),
+            ("Spice", "spice"),
+            ("cadstar", "cadstar"),
+        ] {
+            assert_eq!(netlist_format(friendly), v10, "{friendly}");
         }
     }
 
