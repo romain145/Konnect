@@ -84,6 +84,9 @@ struct DesignComponent {
     footprint_id: String,
     symbol_path: String,
     dnp: bool,
+    /// KiCad's Exclude from BOM: the part stays on the board and its footprint
+    /// takes `exclude_from_bill_of_materials` (#137).
+    exclude_from_bom: bool,
     pad_nets: BTreeMap<String, String>,
 }
 
@@ -117,6 +120,7 @@ struct BoardFootprint {
     layer: String,
     locked: bool,
     dnp: bool,
+    exclude_from_bom: bool,
     not_in_schematic: bool,
 }
 
@@ -173,6 +177,7 @@ enum PlannedChange {
         footprint_id: String,
         symbol_path: String,
         dnp: bool,
+        exclude_from_bom: bool,
         pad_nets: BTreeMap<String, String>,
         position: Point,
     },
@@ -182,6 +187,7 @@ enum PlannedChange {
         value: String,
         symbol_path: String,
         dnp: bool,
+        exclude_from_bom: bool,
         pad_nets: BTreeMap<String, String>,
         preserve: PreservedBoardState,
     },
@@ -788,6 +794,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 footprint_id: component.footprint_id.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                exclude_from_bom: component.exclude_from_bom,
                 pad_nets: component.pad_nets.clone(),
                 position,
             });
@@ -878,6 +885,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
+            || footprint.exclude_from_bom != component.exclude_from_bom
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
@@ -886,6 +894,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 value: component.value.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                exclude_from_bom: component.exclude_from_bom,
                 pad_nets: component.pad_nets.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
@@ -1127,10 +1136,14 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             symbol_stamp.trim_matches('/')
         )
         .replace("//", "/");
-        let dnp = component_node.find_all("property").iter().any(|property| {
-            property.find_str("name") == Some("dnp")
-                || property.get(1).and_then(SexpNode::as_str) == Some("dnp")
-        });
+        let has_property = |name: &str| {
+            component_node.find_all("property").iter().any(|property| {
+                property.find_str("name") == Some(name)
+                    || property.get(1).and_then(SexpNode::as_str) == Some(name)
+            })
+        };
+        let dnp = has_property("dnp");
+        let exclude_from_bom = has_property("exclude_from_bom");
 
         let value = required_value(component_node, "value")?;
         // kicad-cli writes no `(footprint …)` node at all for a symbol whose
@@ -1167,6 +1180,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             footprint_id,
             symbol_path,
             dnp,
+            exclude_from_bom,
             pad_nets: BTreeMap::new(),
         });
     }
@@ -1228,6 +1242,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         dnp,
+        exclude_from_bom,
         pad_nets,
         ..
     } = change
@@ -1246,6 +1261,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         *dnp,
+        *exclude_from_bom,
         pad_nets,
         net_codes,
     )?;
@@ -1263,6 +1279,7 @@ fn apply_footprint_fields(
     value: &str,
     symbol_path: &str,
     dnp: bool,
+    exclude_from_bom: bool,
     pad_nets: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
@@ -1287,14 +1304,13 @@ fn apply_footprint_fields(
             .collect(),
         path_human_readable: String::new(),
     });
-    footprint
-        .attributes
-        .get_or_insert_with(Default::default)
-        .do_not_populate = dnp;
-    definition
-        .attributes
-        .get_or_insert_with(Default::default)
-        .do_not_populate = dnp;
+    // The schematic decides DNP and Exclude from BOM, as KiCad's Update PCB
+    // does (#137).
+    for attributes in [&mut footprint.attributes, &mut definition.attributes] {
+        let attributes = attributes.get_or_insert_with(Default::default);
+        attributes.do_not_populate = dnp;
+        attributes.exclude_from_bill_of_materials = exclude_from_bom;
+    }
 
     let mut seen_pads = std::collections::HashSet::new();
     for child in &mut definition.items {
@@ -1683,9 +1699,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1694,11 +1707,11 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return false;
         }
         component.dnp = entry.dnp;
+        component.exclude_from_bom = !entry.in_bom;
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
+    // The same flag governs a component with no footprint: excluded from the
+    // board it is skipped by flag rather than reported as unassigned.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1711,9 +1724,8 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
+        // Only Exclude from board keeps a part off the board. Exclude from
+        // BOM is a footprint attribute, as in KiCad's Update PCB (#137).
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1724,7 +1736,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -1901,6 +1913,11 @@ fn board_footprint_from_instance(
             .attributes
             .as_ref()
             .map(|attributes| attributes.do_not_populate)
+            .unwrap_or(false),
+        exclude_from_bom: footprint
+            .attributes
+            .as_ref()
+            .map(|attributes| attributes.exclude_from_bill_of_materials)
             .unwrap_or(false),
         not_in_schematic: footprint
             .attributes
@@ -2175,8 +2192,9 @@ fn prepare_footprint_source(
 /// attribute, so KiCad treated it as unspecified, and `export_3d`'s default
 /// left every one of them out of the STEP (#789).
 ///
-/// Runs before [`apply_footprint_fields`], which sets DNP from the schematic,
-/// so the schematic overrides a library `dnp` as KiCad's own update does.
+/// Runs before [`apply_footprint_fields`], which sets DNP and Exclude from BOM
+/// from the schematic, so the schematic overrides the library's flags as
+/// KiCad's own update does.
 fn apply_library_data(
     footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
     part: &PreparedFootprint,
@@ -2482,7 +2500,8 @@ fn restage_additions(
 
 /// One footprint the plan adds, as `CreateItems` receives it: built from the
 /// library's pads, drawings and fields, given the rest of the library's data,
-/// then the schematic's reference, value, symbol path, DNP and pad nets.
+/// then the schematic's reference, value, symbol path, DNP, Exclude from BOM
+/// and pad nets.
 fn build_added_footprint(
     change: &PlannedChange,
     part: &PreparedFootprint,
@@ -2494,6 +2513,7 @@ fn build_added_footprint(
         footprint_id,
         symbol_path,
         dnp,
+        exclude_from_bom,
         pad_nets,
         position,
     } = change
@@ -2521,6 +2541,7 @@ fn build_added_footprint(
         value,
         symbol_path,
         *dnp,
+        *exclude_from_bom,
         pad_nets,
         net_codes,
     )?;
@@ -3246,6 +3267,7 @@ mod tests {
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
             dnp: false,
+            exclude_from_bom: false,
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -3270,6 +3292,7 @@ mod tests {
             layer: "F.Cu".to_string(),
             locked: false,
             dnp: false,
+            exclude_from_bom: false,
             not_in_schematic: false,
         }
     }
@@ -3315,6 +3338,7 @@ mod tests {
                     layer: "B.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    exclude_from_bom: false,
                     not_in_schematic: false,
                 },
                 BoardFootprint {
@@ -3330,6 +3354,7 @@ mod tests {
                     layer: "F.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    exclude_from_bom: false,
                     not_in_schematic: true,
                 },
             ],
@@ -3501,6 +3526,7 @@ mod tests {
             value: "NE555".to_string(),
             symbol_path: "/root/u1".to_string(),
             dnp: false,
+            exclude_from_bom: false,
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3551,6 +3577,7 @@ mod tests {
             "U2",
             "NE555",
             "/root/u2",
+            false,
             false,
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::from([("VCC".to_string(), 3)]),
@@ -3642,6 +3669,7 @@ mod tests {
             "NE555",
             "/root/u3",
             false,
+            false,
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
         )
@@ -3699,6 +3727,7 @@ mod tests {
             value: "10k".to_string(),
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
+            exclude_from_bom: false,
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3756,6 +3785,7 @@ mod tests {
                 layer: "F.Cu".to_string(),
                 locked: false,
                 dnp: false,
+                exclude_from_bom: false,
                 not_in_schematic: false,
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
@@ -4845,6 +4875,7 @@ mod tests {
             footprint_id: footprint_id.to_string(),
             symbol_path: format!("/{reference}-uuid"),
             dnp: false,
+            exclude_from_bom: false,
             pad_nets: pads
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
@@ -5880,6 +5911,7 @@ mod tests {
             footprint_id: STOCK_0603.into(),
             symbol_path: "/c1-uuid".into(),
             dnp,
+            exclude_from_bom: false,
             pad_nets: BTreeMap::new(),
             position: Point { x: 10.0, y: 10.0 },
         };
@@ -5903,6 +5935,119 @@ mod tests {
         // A library footprint marked DNP; the schematic says it is fitted.
         part.attributes.do_not_populate = true;
         assert!(!built_dnp(&part, false));
+    }
+
+    /// Exclude from BOM reaches the footprint as KiCad's attribute, both on a
+    /// part the sync adds and on one it updates (#137).
+    #[test]
+    fn the_schematic_decides_exclude_from_bom() {
+        use konnect_ipc::gen::kiapi;
+
+        let part = prepare_footprint_source(include_str!(
+            "../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"
+        ))
+        .unwrap();
+        let addition = PlannedChange::Add {
+            reference: "TP1".into(),
+            value: "TestPoint".into(),
+            footprint_id: STOCK_0603.into(),
+            symbol_path: "/tp1-uuid".into(),
+            dnp: false,
+            exclude_from_bom: true,
+            pad_nets: BTreeMap::new(),
+            position: Point { x: 10.0, y: 10.0 },
+        };
+        let item = build_added_footprint(&addition, &part, &BTreeMap::new()).unwrap();
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("built footprint");
+        assert!(
+            footprint
+                .attributes
+                .as_ref()
+                .unwrap()
+                .exclude_from_bill_of_materials
+        );
+        assert!(
+            footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .exclude_from_bill_of_materials
+        );
+
+        // A placed footprint whose flag differs from the schematic's is updated.
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                exclude_from_bom: true,
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let plan = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+        );
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [PlannedChange::Update {
+                exclude_from_bom: true,
+                ..
+            }]
+        ));
+    }
+
+    /// A part marked Exclude from BOM stays on the board. Only Exclude from
+    /// board drops a part, and a dropped part is always listed as skipped
+    /// (#137). P5 in this KiCad-written schematic is `(in_bom no)
+    /// (on_board yes)`.
+    #[test]
+    fn exclude_from_bom_keeps_the_part_and_only_exclude_from_board_drops_it() {
+        const SCHEMATIC: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        const P5: &str =
+            "/28f865a0-4433-4a53-bbd7-b62f276848e4/00000000-0000-0000-0000-000054a5890a";
+        let directory = tempfile::tempdir().unwrap();
+        let flagged = |source: &str| {
+            let file = directory.path().join("ecc83-pp.kicad_sch");
+            std::fs::write(&file, source).unwrap();
+            let mut design = ExportedDesign {
+                components: vec![resistor("P5", P5)],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+            };
+            apply_saved_symbol_flags(&[file], &mut design).unwrap();
+            design
+        };
+
+        let kept = flagged(SCHEMATIC);
+        assert_eq!(kept.components.len(), 1, "P5 stays on the board");
+        assert!(kept.components[0].exclude_from_bom);
+        assert!(kept.skipped.is_empty());
+
+        // The same part with both flags off is dropped, and named as skipped.
+        let p5 = SCHEMATIC
+            .find("(uuid \"00000000-0000-0000-0000-000054a5890a\")")
+            .unwrap();
+        let on_board = SCHEMATIC[..p5].rfind("(on_board yes)").unwrap();
+        let both_off = format!(
+            "{}(on_board no){}",
+            &SCHEMATIC[..on_board],
+            &SCHEMATIC[on_board + "(on_board yes)".len()..]
+        );
+        let dropped = flagged(&both_off);
+        assert!(dropped.components.is_empty());
+        assert_eq!(
+            dropped.skipped,
+            [SkippedComponent {
+                reference: "P5".into(),
+                symbol_path: P5.into(),
+            }]
+        );
     }
 
     /// A model the shared reader refuses refuses the footprint, under the code

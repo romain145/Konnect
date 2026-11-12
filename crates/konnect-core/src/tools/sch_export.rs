@@ -191,6 +191,8 @@ pub fn tools() -> Vec<ToolDef> {
              and the sync proceeds for every other component. A library footprint that \
              cannot be placed, or a connected pad its footprint does not have, makes the dry \
              run a conflict whose diagnostics name the footprint and every part that needs it. \
+             Only Exclude from board keeps a part off the board; Exclude from BOM and DNP are \
+             set on its footprint as KiCad's Update PCB does. \
              KiCad 10's API cannot carry a pad's fabrication property (heatsink, BGA, \
              mechanical, castellated, ...), so an added footprint whose library pads have \
              one is placed without it: `dropped_pad_properties` lists each such footprint, \
