@@ -1253,8 +1253,8 @@ pub fn tools() -> Vec<ToolDef> {
              so unsaved edits count; 'board_source' selects that. An answer from the \
              saved file names, in 'unmeasured_item_counts', what it could not measure. \
              A live answer names, in 'unavailable_item_classes', each item class KiCad \
-             would not list, with KiCad's answer: KiCad 10 lists neither tables nor \
-             generators.",
+             would not list, with KiCad's answer: KiCad 10 lists no generators, and up \
+             to 10.0.6 no tables either.",
             json!({
                 "type": "object",
                 "properties": {
