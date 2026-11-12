@@ -1,5 +1,5 @@
 //! Wiring writers that join only what they were asked to (#145, #157, #158),
-//! and name exactly one pin (#98).
+//! name exactly one pin (#98), and edit the item's own `(at …)` (#111).
 //!
 //! The sheets are KiCad-saved; see `route_obstacles_kicad10.README.md` and
 //! `duplicate_reference_kicad10.README.md` for their groups and KiCad's
@@ -521,4 +521,112 @@ async fn a_missing_reference_or_pin_is_a_stale_target() {
     assert!(!failed, "{body}");
     assert_eq!(body["wire"]["x1"], 190.5);
     assert_eq!(body["wire"]["y1"], 135.89);
+}
+
+// ─── #111: the item's own (at …) ──────────────────────────────────────────────
+
+/// The direct `(at …)` child of a node, as `(x, y, rotation)`.
+fn at_of(node: &konnect_sexp::SexpNode) -> (f64, f64, f64) {
+    let at = node.find("at").unwrap();
+    (
+        at.get_f64(1).unwrap(),
+        at.get_f64(2).unwrap(),
+        at.get_f64(3).unwrap_or(0.0),
+    )
+}
+
+/// A label named `(at 1 2)`: rotating it turns the label and keeps the name.
+#[tokio::test]
+async fn rotate_label_keeps_a_name_that_holds_at() {
+    let (_directory, path) = sheet(ROUTE);
+    let (failed, body) = call(
+        "add_schematic_net_label",
+        &path,
+        json!({"net": "(at 1 2)", "x": 114.3, "y": 97.79}),
+    )
+    .await;
+    assert!(!failed, "{body}");
+    let (failed, body) = call(
+        "rotate_schematic_label",
+        &path,
+        json!({"net": "(at 1 2)", "x": 114.3, "y": 97.79, "rotation": 180}),
+    )
+    .await;
+    assert!(!failed, "{body}");
+
+    let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let labels = tree.find_all("label");
+    let label = labels
+        .iter()
+        .find(|label| label.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("(at 1 2)"))
+        .expect("the label kept its name");
+    assert_eq!(at_of(label), (114.3, 97.79, 180.0));
+    let justify = label.find("effects").unwrap().find("justify").unwrap();
+    assert_eq!(
+        justify.get(1).and_then(konnect_sexp::SexpNode::as_str),
+        Some("right")
+    );
+}
+
+/// R1's Value is `(at 1 2)`: a move shifts the field and keeps the value.
+#[tokio::test]
+async fn bulk_move_keeps_a_value_that_holds_at() {
+    let (_directory, path) = sheet(ROUTE);
+    let content = std::fs::read_to_string(&path).unwrap();
+    let (start, end) = find_symbol_instance_block(&content, "R1").unwrap();
+    let block = content[start..end].replacen(
+        "(property \"Value\" \"10k\"",
+        "(property \"Value\" \"(at 1 2)\"",
+        1,
+    );
+    std::fs::write(
+        &path,
+        format!("{}{}{}", &content[..start], block, &content[end..]),
+    )
+    .unwrap();
+    let value_at = |path: &Path| {
+        let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let symbol = tree
+            .find_all("symbol")
+            .into_iter()
+            .find(|symbol| {
+                symbol.find_all("property").iter().any(|p| {
+                    p.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference")
+                        && p.get(2).and_then(konnect_sexp::SexpNode::as_str) == Some("R1")
+                })
+            })
+            .unwrap()
+            .clone();
+        let value = symbol
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Value"))
+            .unwrap()
+            .clone();
+        (
+            at_of(&symbol),
+            value
+                .get(2)
+                .and_then(konnect_sexp::SexpNode::as_str)
+                .unwrap()
+                .to_string(),
+            at_of(&value),
+        )
+    };
+    let (symbol_before, _, field_before) = value_at(&path);
+
+    let (failed, body) = call(
+        "bulk_move_schematic_components",
+        &path,
+        json!({"references": ["R1"], "dx": 2.54, "dy": 0}),
+    )
+    .await;
+    assert!(!failed, "{body}");
+    assert_eq!(body["moved_count"], 1);
+    let (symbol_after, value, field_after) = value_at(&path);
+    assert_eq!(value, "(at 1 2)");
+    assert!((symbol_after.0 - symbol_before.0 - 2.54).abs() < 1e-6);
+    assert!((field_after.0 - field_before.0 - 2.54).abs() < 1e-6);
+    assert_eq!(field_after.1, field_before.1);
+    assert_eq!(field_after.2, field_before.2);
 }

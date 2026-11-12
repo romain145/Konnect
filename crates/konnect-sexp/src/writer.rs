@@ -774,6 +774,22 @@ pub fn find_direct_child_blocks(content: &str, parent_tag: &str) -> Vec<(usize, 
     out
 }
 
+/// [`find_direct_child_blocks`], keeping only the children whose head is `tag`.
+///
+/// This is how an editor finds a block's own `(at …)`, `(effects …)` or
+/// `(property …)`: a quoted name or value is never a child block, so a string
+/// that contains `(at ` cannot be taken for one, as a text search for it can.
+pub fn direct_children_with_tag(source: &str, parent: &str, tag: &str) -> Vec<(usize, usize)> {
+    find_direct_child_blocks(source, parent)
+        .into_iter()
+        .filter(|(start, end)| {
+            crate::parser::parse_sexp(&source[*start..*end])
+                .ok()
+                .is_some_and(|node| node.head() == Some(tag))
+        })
+        .collect()
+}
+
 /// Byte range of the direct child of `(parent_tag …)` that encloses `pos`.
 ///
 /// Unlike walking backward to a fixed indentation pattern, this cannot fall
@@ -1008,6 +1024,21 @@ mod block_start_tests {
         let (start, end) = find_enclosing_direct_child_block(content, "kicad_sch", pos).unwrap();
         assert!(content[start..end].starts_with("(wire"));
         assert!(!content[start..end].contains("sheet_instances"));
+    }
+
+    /// A name holding `(at ` is a string, not a child: only the block's own
+    /// `(at …)` comes back, and not one nested in a property (#111).
+    #[test]
+    fn direct_children_with_tag_skips_strings_and_nested_blocks() {
+        let label = "(label \"(at 1 2)\"\n\t(at 114.3 97.79 0)\n\t(property \"x\" \"(at 3 4)\" (at 5 6 0))\n)";
+        let at = direct_children_with_tag(label, "label", "at");
+        assert_eq!(at.len(), 1);
+        assert_eq!(&label[at[0].0..at[0].1], "(at 114.3 97.79 0)");
+        let property = direct_children_with_tag(label, "label", "property");
+        assert_eq!(property.len(), 1);
+        let source = &label[property[0].0..property[0].1];
+        let inner = direct_children_with_tag(source, "property", "at");
+        assert_eq!(&source[inner[0].0..inner[0].1], "(at 5 6 0)");
     }
 }
 
