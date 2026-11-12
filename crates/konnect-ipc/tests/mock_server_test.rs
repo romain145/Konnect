@@ -887,6 +887,104 @@ fn update_items_rejects_missing_per_item_results() {
     );
 }
 
+/// KiCad holding a board whose footprint `owner` owns a group and a design
+/// variant, which its API drops when it updates the footprint (#119). Counts
+/// the `UpdateItems` it receives.
+fn mock_holding_a_footprint_that_owns_a_group(
+    owner: &'static str,
+) -> (MockKicad, Arc<Mutex<usize>>) {
+    let updates = Arc::new(Mutex::new(0));
+    let seen = updates.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("SaveDocumentToString") {
+            let response = kiapi::common::commands::SavedDocumentResponse {
+                document: Some(doc_for("test.kicad_pcb")),
+                contents: format!(
+                    "(kicad_pcb\n\
+                     (footprint \"Package_DIP:DIP-8_W7.62mm\" (uuid \"{owner}\")\n\
+                     (group \"\" (uuid \"g\") (members \"m\"))\n\
+                     (variant (name \"NoTimer\") (dnp yes)))\n\
+                     (footprint \"Resistor_SMD:R_0402\" (uuid \"plain\")))"
+                ),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.SavedDocumentResponse",
+            )));
+        }
+        assert!(
+            message.type_url.ends_with("UpdateItems"),
+            "{}",
+            message.type_url
+        );
+        *seen.lock().unwrap() += 1;
+        let response = kiapi::common::commands::UpdateItemsResponse {
+            header: None,
+            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+            updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                status: Some(kiapi::common::commands::ItemStatus {
+                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                    error_message: String::new(),
+                }),
+                item: None,
+            }],
+        };
+        Some(reply_with(builders::pack_any(
+            &response,
+            "kiapi.common.commands.UpdateItemsResponse",
+        )))
+    });
+    (mock, updates)
+}
+
+fn footprint_update(kiid: &str) -> prost_types::Any {
+    builders::pack_any(
+        &kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: kiid.to_string(),
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.FootprintInstance",
+    )
+}
+
+/// Every tool that updates a footprint through KiCad's API goes through
+/// `update_items`, so the refusal is made there, before anything is sent.
+#[test]
+fn update_items_refuses_a_footprint_update_that_would_drop_what_it_owns() {
+    let (mock, updates) = mock_holding_a_footprint_that_owns_a_group("u1");
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let error = client
+        .update_items(vec![footprint_update("u1")])
+        .expect_err("U1 owns a group and a variant")
+        .to_string();
+
+    assert!(
+        error.starts_with("u1 owns 1 group and variant 'NoTimer'. KiCad drops these"),
+        "{error}"
+    );
+    assert_eq!(*updates.lock().unwrap(), 0, "nothing was sent");
+}
+
+/// The control: a footprint owning none of them, on the same board, is sent.
+#[test]
+fn update_items_sends_a_footprint_that_owns_nothing_it_would_drop() {
+    let (mock, updates) = mock_holding_a_footprint_that_owns_a_group("u1");
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client
+        .update_items(vec![footprint_update("plain")])
+        .expect("R1 owns nothing an update drops");
+
+    assert_eq!(*updates.lock().unwrap(), 1);
+}
+
 #[test]
 fn delete_items_surfaces_per_item_failure() {
     let mock = spawn_mock(|request| {
@@ -3565,6 +3663,26 @@ fn spawn_text_board(board: Arc<Mutex<TextBoard>>) -> MockKicad {
                             .collect(),
                     },
                     "kiapi.common.commands.UpdateItemsResponse",
+                )))
+            }
+            // Read before a footprint update for what it would drop (#119):
+            // the board as KiCad writes it, where these footprints own none
+            // of it.
+            "SaveDocumentToString" => {
+                let footprints = board
+                    .footprints
+                    .iter()
+                    .map(|footprint| {
+                        let kiid = footprint.id.as_ref().map_or("", |id| id.value.as_str());
+                        format!("\n  (footprint \"Mock:Footprint\" (uuid \"{kiid}\"))")
+                    })
+                    .collect::<String>();
+                Some(reply_with(builders::pack_any(
+                    &commands::SavedDocumentResponse {
+                        document: None,
+                        contents: format!("(kicad_pcb{footprints})"),
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
                 )))
             }
             other => panic!("unexpected command {other}"),

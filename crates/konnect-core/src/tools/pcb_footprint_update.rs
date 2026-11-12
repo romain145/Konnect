@@ -3808,13 +3808,24 @@ mod tests {
         socket.listen(&url).unwrap();
 
         let board_name = board.to_string_lossy().to_string();
+        let board_path = board.to_path_buf();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
-                let response = if message.type_url.ends_with("GetOpenDocuments") {
+                let response = if message.type_url.ends_with("SaveDocumentToString") {
+                    // The board as KiCad holds it, read before a footprint
+                    // update for what the update would drop (#119).
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: None,
+                            contents: std::fs::read_to_string(&board_path).unwrap(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else if message.type_url.ends_with("GetOpenDocuments") {
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::GetOpenDocumentsResponse {
                             documents: vec![kiapi::common::types::DocumentSpecifier {

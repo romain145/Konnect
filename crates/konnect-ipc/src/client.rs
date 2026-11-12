@@ -2321,6 +2321,7 @@ impl KiCadIpcClient {
         if items.is_empty() {
             return Ok(());
         }
+        self.refuse_footprint_updates_that_drop_children(&document, &items)?;
         let expected_count = items.len();
         let header = header_for(document);
         let cmd = kiapi::common::commands::UpdateItems {
@@ -2352,6 +2353,64 @@ impl KiCadIpcClient {
             }
         }
         Ok(())
+    }
+
+    /// Refuse an update that would make KiCad drop what a footprint owns.
+    ///
+    /// KiCad's API updates a footprint by replacing it with one built from the
+    /// `FootprintInstance` sent. Seen on KiCad 10.0.8 with
+    /// `footprint_children_kicad10.kicad_pcb`: changing U1's value this way
+    /// removed U1's own group and its `NoTimer` design variant from the board,
+    /// and the call reported success. The message carries neither, and no item
+    /// read lists them, so the board as KiCad writes it is the only place they
+    /// can be seen.
+    ///
+    /// A point the message carries is kept, as KiCad 10.0.8 sends the stock
+    /// footprints' points; one it does not carry is lost too.
+    ///
+    /// The update goes ahead when that text cannot be read: a KiCad that will
+    /// not serialise the board is the state before this check existed, not
+    /// evidence of a loss. Only an update that sends a footprint reads it.
+    fn refuse_footprint_updates_that_drop_children(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        items: &[prost_types::Any],
+    ) -> Result<()> {
+        use crate::footprint_children::{updates_dropping_children, SentFootprint};
+
+        let sent = items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.FootprintInstance"))
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .filter_map(|footprint| {
+                Some(SentFootprint {
+                    reference: footprint_reference(&footprint).to_string(),
+                    carried_points: crate::footprint_children::reference_points_carried(&footprint),
+                    kiid: footprint.id?.value,
+                })
+            })
+            .collect::<Vec<_>>();
+        if sent.is_empty() {
+            return Ok(());
+        }
+        let board_text = match self.save_document_to_string_in(document.clone()) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::debug!("footprint children not checked before update: {error:#}");
+                return Ok(());
+            }
+        };
+        let dropped = updates_dropping_children(&board_text, &sent);
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{}. KiCad drops these when its API updates a footprint, so nothing was sent; \
+             make this change in KiCad, which edits the footprint in place",
+            dropped.join("; ")
+        )
     }
 
     /// Delete items by KIID.
