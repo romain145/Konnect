@@ -2444,18 +2444,45 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Wait for the bound board to accept reads after an asynchronous operation.
+    /// Wait for the bound board to accept commands after an asynchronous
+    /// operation such as a zone refill.
     /// Only KiCad's explicit AS_BUSY response is retried; mutations are never replayed.
+    ///
+    /// The probe is an item read, because that is a command KiCad gates.
+    /// Measured on KiCad 10.0.8 during a refill: `GetOpenDocuments` and
+    /// `GetNets` are answered throughout, while `GetItems` and `SaveDocument`
+    /// are refused with AS_BUSY for the 0.2–0.4 s the fill takes on a small
+    /// board. Probing with `GetOpenDocuments` alone therefore called a board
+    /// ready that then refused the save.
     pub fn wait_for_board_ready(&self, timeout: std::time::Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
+        let is_busy = |error: &anyhow::Error| {
+            ApiStatusError::from_error(error)
+                .is_some_and(|status| status.code == kiapi::common::ApiStatusCode::AsBusy as i32)
+        };
         loop {
-            match self.get_board_document() {
-                Ok(_) => return Ok(()),
+            let probe = self.get_board_document().and_then(|document| {
+                // Dimensions: a class every board accepts and few boards fill.
+                let command = kiapi::common::commands::GetItems {
+                    header: Some(header_for(document)),
+                    types: vec![kiapi::common::types::KiCadObjectType::KotPcbDimension as i32],
+                };
+                match self.send_command(&command, "kiapi.common.commands.GetItems") {
+                    Ok(_) => Ok(()),
+                    // KiCad checks for busy before anything else, so any other
+                    // status it answers with came from a board that is not.
+                    Err(error)
+                        if !is_busy(&error) && ApiStatusError::from_error(&error).is_some() =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+            match probe {
+                Ok(()) => return Ok(()),
                 Err(error) => {
-                    let busy = ApiStatusError::from_error(&error).is_some_and(|status| {
-                        status.code == kiapi::common::ApiStatusCode::AsBusy as i32
-                    });
-                    if !busy || std::time::Instant::now() >= deadline {
+                    if !is_busy(&error) || std::time::Instant::now() >= deadline {
                         return Err(error.context("board readiness could not be established"));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2905,6 +2932,11 @@ impl KiCadIpcClient {
         let any = crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
         let created = self.create_items_returning(vec![any])?;
         self.refill_zones()?;
+        // KiCad refuses item reads and saves with AS_BUSY while it fills, so
+        // returning now would hand that refusal to whatever the caller does
+        // next. The zone exists either way: a wait that fails is not an error
+        // of this call, and the next command reports its own.
+        let _ = self.wait_for_board_ready(std::time::Duration::from_secs(30));
         // Discriminate on the declared type, never on whether a decode happens
         // to succeed — see `builders::any_is` for why that distinction cost
         // every synced footprint its graphics (#244).
