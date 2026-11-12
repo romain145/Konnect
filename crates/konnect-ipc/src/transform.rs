@@ -265,6 +265,63 @@ fn xform_dimension(dim: &mut board::Dimension, xf: &Xform) {
     }
 }
 
+/// A footprint's `(point …)` as KiCad 10.0.8 sends it. 617 of the stock
+/// footprints carry one, every `Package_DIP` among them.
+pub const REFERENCE_POINT: &str = "kiapi.board.types.ReferencePoint";
+
+/// Move a `ReferencePoint`'s position, leaving every other field as sent.
+///
+/// The vendored protos predate the message, so its layout is read from what
+/// KiCad 10.0.8 sent for the stock `DIP-8_W7.62mm` point: 1 = id (KIID),
+/// 2 = layer, 3 = position (`Vector2`, absolute like every other child),
+/// 4 = size (`Distance`), 5 = locked, 6 = a second KIID. Only field 3 is
+/// decoded; the rest is copied byte for byte, so a field this reading has
+/// wrong, or one a later KiCad adds, is still returned to KiCad unchanged.
+fn xform_reference_point(value: &[u8], xf: &Xform) -> Result<Vec<u8>> {
+    use prost::encoding::{decode_key, decode_varint, encode_key, encode_varint, WireType};
+    const POSITION: u32 = 3;
+
+    let mut rest = value;
+    let mut out = Vec::with_capacity(value.len() + 8);
+    let mut moved = false;
+    while !rest.is_empty() {
+        let before = rest;
+        let (tag, wire_type) = decode_key(&mut rest)?;
+        let length = match wire_type {
+            WireType::Varint => {
+                decode_varint(&mut rest)?;
+                0
+            }
+            WireType::SixtyFourBit => 8,
+            WireType::ThirtyTwoBit => 4,
+            WireType::LengthDelimited => decode_varint(&mut rest)? as usize,
+            other => anyhow::bail!("reference point has a field of wire type {other:?}"),
+        };
+        anyhow::ensure!(rest.len() >= length, "reference point is truncated");
+        let (payload, after) = rest.split_at(length);
+        rest = after;
+        if tag == POSITION && wire_type == WireType::LengthDelimited {
+            let mut position = Some(common::Vector2::decode(payload)?);
+            xform_vec2(&mut position, xf);
+            let position = position.unwrap_or_default().encode_to_vec();
+            encode_key(POSITION, WireType::LengthDelimited, &mut out);
+            encode_varint(position.len() as u64, &mut out);
+            out.extend_from_slice(&position);
+            moved = true;
+        } else {
+            out.extend_from_slice(&before[..before.len() - rest.len()]);
+        }
+    }
+    // proto3 leaves out a zero Vector2, and an absent position is one this
+    // cannot move: the point would stay at the board origin.
+    anyhow::ensure!(
+        moved,
+        "footprint contains a reference point with no position; refusing to \
+         move/rotate it via IPC to avoid detaching it"
+    );
+    Ok(out)
+}
+
 /// Apply `xf` to every position-bearing child carried in `fp`: the four
 /// mandatory fields plus all `definition.items`. Does NOT touch
 /// `fp.position` / `fp.orientation` — the caller sets those.
@@ -330,6 +387,8 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             item.value = dim.encode_to_vec();
         } else if url == "kiapi.board.types.Footprint3DModel" || url == "kiapi.board.types.Group" {
             // No board-space geometry of their own — nothing to shift.
+        } else if url == REFERENCE_POINT {
+            item.value = xform_reference_point(&item.value, xf)?;
         } else {
             // KiCAD would re-create this item wherever the stale message
             // says it is; refusing beats silently corrupting the board.
@@ -387,6 +446,110 @@ mod tests {
 
     fn decode_pad(any: &prost_types::Any) -> board::Pad {
         board::Pad::decode(any.value.as_slice()).unwrap()
+    }
+
+    /// The `ReferencePoint` KiCad 10.0.8 sent for U1 (stock `DIP-8_W7.62mm`,
+    /// placed at (68.38, 63.88)) on `footprint_children_kicad10.kicad_pcb`:
+    /// position (72.19, 67.69), size 1.27 mm.
+    fn captured_reference_point() -> Vec<u8> {
+        let hex = "0a260a2435383865343439322d643735622d346364372d613561652d6364363330\
+                   6239356265623110341a0a08b090b6221090bca320220408f0c14d280132260a24\
+                   63373930313234352d643063342d343736662d383231352d383566313138336430\
+                   346465";
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The position a reference point carries, read the way the transform
+    /// reads it.
+    fn reference_point_position(value: &[u8]) -> (i64, i64) {
+        use prost::encoding::{decode_key, decode_varint, WireType};
+        let mut rest = value;
+        while !rest.is_empty() {
+            let (tag, wire_type) = decode_key(&mut rest).unwrap();
+            if wire_type == WireType::Varint {
+                decode_varint(&mut rest).unwrap();
+                continue;
+            }
+            let length = decode_varint(&mut rest).unwrap() as usize;
+            let (payload, after) = rest.split_at(length);
+            rest = after;
+            if tag == 3 {
+                let position = common::Vector2::decode(payload).unwrap();
+                return (position.x_nm, position.y_nm);
+            }
+        }
+        panic!("no position");
+    }
+
+    /// Moving or rotating a footprint used to be refused when it carried a
+    /// `(point …)`, which every stock DIP does. The point moves with the
+    /// footprint, and every other byte KiCad sent goes back as it came.
+    #[test]
+    fn a_reference_point_moves_with_its_footprint_and_keeps_its_other_fields() {
+        let captured = captured_reference_point();
+        assert_eq!(
+            reference_point_position(&captured),
+            (72_190_000, 67_690_000)
+        );
+        let point = || prost_types::Any {
+            type_url: format!("type.googleapis.com/{REFERENCE_POINT}"),
+            value: captured.clone(),
+        };
+
+        let mut moved = instance_with(vec![point()]);
+        transform_footprint_children(
+            &mut moved,
+            &Xform::Translate {
+                dx_nm: 10_000_000,
+                dy_nm: -5_000_000,
+            },
+        )
+        .unwrap();
+        let value = &moved.definition.as_ref().unwrap().items[0].value;
+        assert_eq!(reference_point_position(value), (82_190_000, 62_690_000));
+        // Same length, and identical outside the ten bytes of the position:
+        // the id (40 bytes) and layer (2) come first, then field 3's key and
+        // length, so the position is bytes 44..54.
+        assert_eq!(value.len(), captured.len());
+        assert_eq!(value[..44], captured[..44]);
+        assert_eq!(value[54..], captured[54..]);
+
+        // Unchanged by a move of nothing: the copy is exact.
+        let mut still = instance_with(vec![point()]);
+        transform_footprint_children(&mut still, &Xform::Translate { dx_nm: 0, dy_nm: 0 }).unwrap();
+        assert_eq!(still.definition.unwrap().items[0].value, captured);
+
+        // A quarter turn about the footprint's anchor (68.38, 63.88): the
+        // point at (+3.81, +3.81) lands at (+3.81, -3.81).
+        let mut turned = instance_with(vec![point()]);
+        transform_footprint_children(
+            &mut turned,
+            &Xform::Rotate {
+                cx_nm: 68_380_000,
+                cy_nm: 63_880_000,
+                delta_deg: 90.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reference_point_position(&turned.definition.unwrap().items[0].value),
+            (72_190_000, 60_070_000)
+        );
+    }
+
+    #[test]
+    fn a_reference_point_with_no_position_is_refused_not_left_behind() {
+        let mut footprint = instance_with(vec![prost_types::Any {
+            type_url: format!("type.googleapis.com/{REFERENCE_POINT}"),
+            value: vec![0x10, 0x34],
+        }]);
+        let error =
+            transform_footprint_children(&mut footprint, &Xform::Translate { dx_nm: 1, dy_nm: 1 })
+                .unwrap_err();
+        assert!(error.to_string().contains("no position"), "{error}");
     }
 
     #[test]
