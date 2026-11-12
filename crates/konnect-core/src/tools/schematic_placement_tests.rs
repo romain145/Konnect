@@ -1270,3 +1270,46 @@ async fn a_power_symbol_is_snapped_through_the_served_dispatch() {
     assert_eq!(placed["x"].as_f64(), Some(symbol.at.x));
     assert_eq!(placed["y"].as_f64(), Some(symbol.at.y));
 }
+
+/// KiCad 10 keeps a non-nil root sheet UUID in the project file and eeschema
+/// keys every instance path to it (#166). Paths it wrote that way are accepted
+/// and new symbols are written under them; paths under the schematic's own
+/// UUID are what KiCad would not resolve, and are refused.
+#[tokio::test]
+async fn placement_follows_the_project_top_level_sheet_uuid() {
+    use schematic_target_tests::{set_top_level_sheets, HEADER_UUID, PROJECT_UUID};
+    let top_level = json!([
+        {"filename": "complex_hierarchy.kicad_sch", "name": "", "uuid": PROJECT_UUID}
+    ]);
+    let expected = [
+        PATH_A.replace(HEADER_UUID, PROJECT_UUID),
+        PATH_B.replace(HEADER_UUID, PROJECT_UUID),
+    ];
+    for name in PLACERS {
+        let (_directory, root, child) = fixture(true);
+        set_top_level_sheets(&root, top_level.clone());
+        // File the existing symbols the way eeschema writes them for this
+        // project: under the project's UUID.
+        let source = std::fs::read_to_string(&child).unwrap();
+        std::fs::write(&child, source.replace(HEADER_UUID, PROJECT_UUID)).unwrap();
+        let result = place(name, &child).await;
+        assert!(!result.is_error, "{name}: {result:?}");
+        let response = body(&result);
+        let placed = if name == "batch_place_components" {
+            response["placed"].as_array().unwrap().clone()
+        } else {
+            vec![response]
+        };
+        for entry in placed {
+            assert_eq!(entry["instance_paths"], json!(expected), "{name}");
+        }
+    }
+
+    let (_directory, root, child) = fixture(true);
+    set_top_level_sheets(&root, top_level);
+    let before = std::fs::read(&child).unwrap();
+    let result = place("add_schematic_component", &child).await;
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(body(&result)["error"]["kind"], "stale_target");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
