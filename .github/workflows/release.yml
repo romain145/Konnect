@@ -185,6 +185,16 @@ jobs:
             target/aarch64-apple-darwin/release/konnect \
             target/x86_64-apple-darwin/release/konnect
           lipo -info dist/universal/konnect
+          # The linker signs only the arm64 slice, so the merged binary had no
+          # designated requirement and macOS TCC re-prompted for Documents
+          # access on every launch (#2). Sign both slices, then check them.
+          codesign --force --sign - --identifier konnect dist/universal/konnect
+          for arch in arm64 x86_64; do
+            codesign --verify --strict --arch "$arch" dist/universal/konnect
+          done
+          requirement="$(codesign -d -r- dist/universal/konnect 2>&1)"
+          echo "$requirement"
+          grep -q 'designated =>' <<<"$requirement"
 
       - name: Build universal schematic viewer (macOS, optional)
         if: matrix.platform == 'macos'
@@ -198,6 +208,13 @@ jobs:
             crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
             crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
           lipo -info dist/universal/schematic-viewer
+          codesign --force --sign - --identifier schematic-viewer dist/universal/schematic-viewer
+          for arch in arm64 x86_64; do
+            codesign --verify --strict --arch "$arch" dist/universal/schematic-viewer
+          done
+          requirement="$(codesign -d -r- dist/universal/schematic-viewer 2>&1)"
+          echo "$requirement"
+          grep -q 'designated =>' <<<"$requirement"
 
       - name: Require viewer binary (macOS)
         if: matrix.platform == 'macos'
