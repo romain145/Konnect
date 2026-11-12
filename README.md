@@ -39,6 +39,25 @@ client configuration keeps working.
 
 ### What this fork has added
 
+**0.13.2**
+
+- **Wiring tools no longer short nets.** `connect_pins`, `connect_to_net` and
+  their batch forms check each route or stub before writing it. One that would
+  join another net's pin, label or sheet pin is drawn another way, or refused
+  with what is in the way. Wire tools dot only the T-junctions the new wire
+  makes, and a reference placed twice is refused instead of wiring one copy.
+- **Schematic to PCB sync:** a ground pour no longer blocks every pad-net
+  change, parts marked Exclude from BOM are placed, and an update that would
+  drop a footprint's groups, points or variants is refused with the reason.
+- **DRC and design rules:** `get_drc_severities` and `set_drc_severities` read
+  and set violation severities; `set_design_rules` sets copper-to-edge and
+  silkscreen text minima; `run_drc` counts violations per rule.
+- **Board text:** placed text takes mirror, alignment, bold, italic, knockout,
+  keep-upright, locked and font, and `set_footprint_field_style` restyles
+  reference or value fields on many footprints at once.
+- **Safer writes:** board, project-file and rename writes refuse a file that
+  changed under them, and board-file fallbacks write layer names KiCAD 10 loads.
+
 **0.13.1**
 
 - **Silkscreen text tools** in the `pcb_board` toolset: `list_footprint_fields`,
