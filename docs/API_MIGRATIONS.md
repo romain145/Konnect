@@ -3,6 +3,175 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a copper zone marks only its own net as routed (patch release)
+
+`update_pcb_from_schematic` and `update_footprints_from_library` used to count
+every board net as routed once the board held any zone. On a board with a
+ground pour, every pad-net change was then a `routed_pad_net_change` conflict,
+even for a net with no tracks, arcs, vias or zone. A copper zone now counts
+only on its own net (`Zone.copper_settings.net`), a rule area or a copper zone
+on no net counts on none, and a zone whose net cannot be read still counts on
+every net. A pad-net change on the zone's net, or on a net with tracks, is still
+a conflict. In `update_footprints_from_library` the set only words the refusal
+of a library update that removes a connected pad, so that refusal no longer says
+"with routed copper" for a net that has none. The response shape is unchanged
+(#96, #133).
+
+## Unreleased: `update_pcb_from_schematic` keeps parts marked Exclude from BOM (patch release)
+
+A symbol marked Exclude from BOM (`in_bom no`) was left off the board. It is
+now placed and updated like any other part, and its footprint takes
+`exclude_from_bill_of_materials` from the schematic, as DNP is carried and as
+KiCad's Update PCB does. A placed footprint whose flag differs from its symbol's
+is planned as an `update`. Only Exclude from board (`on_board no`) keeps a part
+off the board, and such a part is now always counted under `skipped_by_flag`;
+one with both flags off used to be dropped without being listed. Planned
+`add` and `update` changes gain `exclude_from_bom` beside `dnp` (#137).
+
+## Unreleased: a side change mirrors inner copper layers (patch release)
+
+`flip_component`'s board-file path and `update_footprints_from_library`'s
+rebuild of a back-side footprint used to leave inner copper layers where they
+were. They now mirror them through the board's copper stack as KiCad's flip
+does: on N copper layers `In<k>.Cu` becomes `In<N-1-k>.Cu`, so In2.Cu and
+In5.Cu swap on eight layers. Wildcards (`*.Cu`) and non-copper layers are
+unchanged. A footprint with an inner layer the board does not have is refused
+and nothing is written. `update_footprints_from_library` reads the copper
+count from KiCad; when KiCad will not report it, a back-side footprint with
+inner-layer items is refused, and every other footprint is unaffected (#117).
+
+## Unreleased: footprint updates through KiCad's API refuse to drop a footprint's groups, points or variants (patch release)
+
+KiCad's API updates a footprint by replacing it with one built from the
+footprint message sent. That message carries none of the footprint's groups or
+design variants, and its points only when KiCad sent them with the footprint
+(10.0.8 does, 10.0.6 does not), so the replacement lacked them and the call
+reported success. `update_pcb_from_schematic` now makes the dry run and the
+apply a `conflict` for a planned update of such a footprint, before any commit,
+with one `footprint_children_not_carried` diagnostic per footprint naming what
+it would lose. Update those footprints with KiCad's Update PCB from Schematic,
+which edits them in place. No item read lists these, so the sync reads the
+board as KiCad writes it, and only when the plan updates a footprint; a
+footprint missing from that text, or text that does not parse, refuses the
+update the same way.
+
+Every other tool that updates a placed footprint through KiCad's API (moving
+or rotating it, setting its value or placement, editing its graphics or 3D
+models, repairing or refreshing it from its library) refuses the same way and
+sends nothing. Flipping is unaffected: KiCad flips a footprint in place. It reads the board only when the update sends a footprint, and goes
+ahead when KiCad will not write the board out. `update_footprints_from_library`
+does not predict this refusal in its dry run; its apply refuses. Moving or
+rotating a footprint that carries a point, as 617 stock footprints do (every
+`Package_DIP` among them), used to be refused outright; the point now moves
+with it.
+
+A footprint's membership of a board-level group is not affected: KiCad restores
+it on replacement. An update still drops what a footprint owns beyond these
+three that the message does not carry, such as its unit metadata, which KiCad's
+own Update PCB restores. Response shapes are unchanged. Ported from
+mixelpixx/Konnect#865 (#119).
+
+## Unreleased: `connect_pins`, `batch_connect_pins` and `add_schematic_connection` refuse a route that joins another net (patch release)
+
+These tools route an L-bend, horizontal leg first. A leg that passed over
+another pin's tip got a junction there, and a leg that ended on a pin, label
+or sheet pin met it, so the pin joined the route's net and the call reported
+success. Now each route is checked before it is written: if it would put any
+pin, label or sheet pin on the route's net that was not on the net of either
+end before, the vertical-first bend is tried. When that joins one too, as it
+does for two parts side by side wired bottom pin to top pin, up to four
+three-leg doglegs are tried, through the grid lines at the middle and quarter
+points between the two ends; a dogleg is kept only when it also crosses no
+symbol, pins included. When every route fails the call is refused as
+`plan_blocked` with one reason per route, naming what is in the way, and
+nothing is written. A straight route has only one route to try.
+`add_schematic_connection` treats a wire an end lies on as part of that end's
+net, so tapping a wire mid-span still works. `connect_pins` and
+`add_schematic_connection` responses gain `path`, the points the wire runs
+through, corners included. `batch_connect_pins` skips a refused pair, lists it
+in `errors`, and adds `failures` (`index`, `connection`, `kind`, `reasons`,
+`message`), present only when a pair was refused; `connected_count` counts only
+the pairs written. On a sheet where a placed symbol's library pins cannot be
+read the check cannot see them, so `connect_pins` and
+`add_schematic_connection` refuse with `plan_blocked` and `batch_connect_pins`
+refuses every pair (#145).
+
+## Unreleased: `connect_to_net` and `batch_connect_to_net` refuse a stub that joins another net (patch release)
+
+A stub that ended on another pin, or passed over one, joined it to the
+requested net. The stub and its label are now checked the same way as a
+route, with the requested net allowed: joining existing labels of that name is
+the point of the call. With `direction: "auto"` (the default), a stub that
+would join another net is tried in the two directions across the pin, never
+back over the symbol; the response gains `skipped_directions`, one reason per
+direction passed over, present only when one was. With a named direction, or
+when every direction is blocked, `connect_to_net` is refused as
+`plan_blocked` and nothing is written. `batch_connect_to_net` applies the same
+rule per pin: a refused pin is listed in `errors` and in a new `failures`
+array (`index`, `reference`, `pin`, `kind`, `message`), present only when a
+pin was refused, and the other pins are still connected. Both refuse with
+`plan_blocked` on a sheet whose placed symbols' library pins cannot all be
+read (#157).
+
+## Unreleased: wire tools dot only the T's the new wire makes (patch release)
+
+`add_wire`, `batch_add_wire`, the routes of `connect_pins`,
+`batch_connect_pins` and `add_schematic_connection`, and the stubs of
+`connect_to_net` and `batch_connect_to_net` added a junction at every T on the
+sheet where a wire ends mid-span on another without one. KiCad does not join
+such a T, so each was two nets, and any wire drawn anywhere joined them. Now
+only the T's the new wire forms are dotted: an end of the new wire inside
+another wire, or another wire's end inside the new one. Pins the new wire
+passes over mid-span are still dotted. No argument or response field changed
+(#158).
+
+## Unreleased: pin-naming wiring tools refuse a reference that names more than one placed pin (patch release)
+
+`connect_to_net`, `connect_pins`, `batch_connect_to_net` and
+`batch_connect_pins` took the first placed symbol carrying the named pin, so
+with two symbols sharing a reference they wired one of them, chosen by file
+order. They now refuse as `ambiguous_target` when the reference and pin number
+name more than one placed pin: two symbols with one reference, or a pin drawn
+on more than one placed unit of one symbol. `candidates` lists each one as
+`unit <n> <uuid> at (<x>, <y>)`, and nothing is written for it. A missing
+reference or pin, or a placed unit whose library symbol is not embedded, is
+`stale_target` with the old message as `reason`; `connect_pins` used to return
+these as an untyped handler error and `connect_to_net` as free text. The batch
+tools list such a pin in `errors` and in `failures` with its `kind` and its
+`candidates` or `reason`, and connect the rest. Pins stacked on one point of
+one placed unit still count as one (#98).
+
+## Unreleased: `rotate_schematic_label` and `bulk_move_schematic_components` edit the item's own position (patch release)
+
+Both tools found an `(at …)` by searching the item's text, so a label named
+`(at 1 2)`, or a field value containing `(at `, was rewritten instead of the
+position, and the call reported success. They now edit the `(at …)` that is a
+direct child of the label, symbol or field. `rotate_schematic_label` also finds
+the label's own `(effects …)`, `(justify …)` and `(uuid …)` the same way, so a
+global label's Intersheetrefs field is no longer taken for the label's. No
+argument or response field changed (#111).
+
+## Unreleased: schematic writers key instance paths to the project's top-level sheet UUID (patch release)
+
+KiCad 10 can record the root sheet's UUID in the project file, at
+`schematic.top_level_sheets[].uuid`. eeschema keys every instance path to that
+UUID when it is not nil, even with one top-level sheet, rather than to the root
+schematic's own `(uuid …)`. Konnect always used the schematic's UUID, so on
+such a project every placement was refused as `stale_target` although the paths
+were the ones KiCad wrote. The root UUID now comes from the `top_level_sheets`
+entry whose `filename` is the root schematic when that UUID is not nil, and
+from the schematic's `(uuid …)` otherwise. This applies to every tool that
+checks or writes placement paths (`add_schematic_component`,
+`batch_place_components`, `add_power_symbol` and the others that read the
+project's ownership), and to the sheet paths `add_hierarchical_sheet`,
+`duplicate_sheet` and `renumber_sheet_pages` write on a project root. On such a
+project, symbols filed under the schematic's own UUID are now the stale ones.
+A `top_level_sheets` that is not a list, or whose entry for the root has no
+filename, an unreadable UUID or two different UUIDs, makes ownership unprovable
+(`conflict`); a project file that is not JSON records nothing and the
+schematic's UUID is used. The schematic file is never rewritten to match
+(#166).
+
 ## Unreleased: `set_design_rules` refuses values KiCad would reset (patch release)
 
 `min_clearance`, `min_trace_width`, `min_via_drill` and `min_via_size` must be

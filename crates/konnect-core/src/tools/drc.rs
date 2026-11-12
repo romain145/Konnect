@@ -150,13 +150,20 @@ pub(crate) async fn run(
         let path = board.to_path_buf();
         let synchronized = with_board_ipc_classified(ctx, board, move |client, _| {
             let operation = || -> anyhow::Result<String> {
+                use anyhow::Context as _;
                 if refill {
-                    client.refill_zones()?;
-                    client.wait_for_board_ready(READY_TIMEOUT)?;
+                    client.refill_zones().context("zone refill")?;
+                    client
+                        .wait_for_board_ready(READY_TIMEOUT)
+                        .context("after the zone refill")?;
                 }
-                client.save_board()?;
-                client.wait_for_board_ready(READY_TIMEOUT)?;
-                let live = client.save_document_to_string()?;
+                client.save_board().context("board save")?;
+                client
+                    .wait_for_board_ready(READY_TIMEOUT)
+                    .context("after the board save")?;
+                let live = client
+                    .save_document_to_string()
+                    .context("reading the board back")?;
                 let saved = std::fs::read_to_string(&path)?;
                 let mut live_tree = konnect_sexp::parse_sexp(&live)?;
                 let mut saved_tree = konnect_sexp::parse_sexp(&saved)?;
@@ -167,7 +174,8 @@ pub(crate) async fn run(
                 }
                 Ok(saved)
             };
-            Ok(operation().map_err(|error| uncertain(&path, "synchronize_drc_source", error)))
+            Ok(operation()
+                .map_err(|error| uncertain(&path, "synchronize_drc_source", format!("{error:#}"))))
         })
         .await?;
         match synchronized {
@@ -318,11 +326,26 @@ mod tests {
             let command = request.message.unwrap();
             let name = command.type_url.rsplit('/').next().unwrap().to_string();
             commands.lock().unwrap().push(name.clone());
-            if *busy.lock().unwrap() && name == "kiapi.common.commands.GetOpenDocuments" {
-                if mode != "busy-forever" {
-                    *busy.lock().unwrap() = false;
+            // As KiCad 10.0.8 does while it refills: open documents are still
+            // answered, item reads are refused as busy.
+            if name == "kiapi.common.commands.GetItems" {
+                if *busy.lock().unwrap() {
+                    if mode != "busy-forever" {
+                        *busy.lock().unwrap() = false;
+                    }
+                    return response(None, true);
                 }
-                return response(None, true);
+                return response(
+                    packed(
+                        kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: Vec::new(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ),
+                    false,
+                );
             }
             let document = |filename: &str| kiapi::common::types::DocumentSpecifier {
                 r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
@@ -791,9 +814,12 @@ mod tests {
         client.delete_items(vec![uuid.clone()]).unwrap();
         // Add an unfilled native copper zone as a second observable outcome:
         // a refill acknowledgement alone must not pass the live regression.
+        // `live_ipc.kicad_pcb`, the board the other live suites open, draws its
+        // outline as one gr_rect; either form gives the corners.
         let corners: Vec<_> = tree
             .find_all("gr_line")
             .into_iter()
+            .chain(tree.find_all("gr_rect"))
             .filter(|node| {
                 node.find("layer")
                     .and_then(|layer| layer.get(1))
@@ -806,7 +832,7 @@ mod tests {
             .collect();
         assert!(
             !corners.is_empty(),
-            "native fixture must have a line-based board outline"
+            "native fixture must have a line or rectangle board outline"
         );
         let left = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) + 0.5;
         let right = corners

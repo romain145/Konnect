@@ -1012,6 +1012,98 @@ fn adding_a_zone_creates_it_on_the_live_board() {
     );
 }
 
+/// A board is ready when it accepts the next command, not when it lists its
+/// documents.
+///
+/// KiCad refuses gated commands with AS_BUSY while it refills zones, and
+/// `GetOpenDocuments` is not one of them: measured on 10.0.8, it and `GetNets`
+/// are answered throughout a refill while `GetItems` and `SaveDocument` are
+/// refused for 0.2-0.4 s on this board. `wait_for_board_ready` probed with
+/// `GetOpenDocuments`, so `run_drc`'s synchronised refill-then-save failed
+/// about every other run with `mutation_outcome_uncertain` on the save. The
+/// mocks agreed with the probe, which is why only a live KiCad shows it.
+///
+/// Several rounds, because one refill can finish before the save by luck.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled and a disposable open board"]
+fn a_board_called_ready_after_a_refill_accepts_a_save() {
+    use konnect_ipc::gen::kiapi::board::types::{Zone, ZoneConnectionStyle};
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
+    use prost::Message;
+
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+    client
+        .find_open_board(Path::new(&board))
+        .expect("KiCad has not got the requested board open");
+    let net = client
+        .get_nets()
+        .expect("net list query failed")
+        .into_iter()
+        .find(|net| net.name == "GND")
+        .expect("the live fixture must contain GND");
+    let name = "konnect live readiness";
+    let mut created = Vec::new();
+    let mut busy_seen = 0;
+    for round in 0..4 {
+        // A new unfilled pour over the whole board each round, so every
+        // refill has real work to do.
+        let zone = konnect_ipc::builders::build_zone(
+            &konnect_ipc::builders::ZoneSpec {
+                layer: if round % 2 == 0 { "F.Cu" } else { "B.Cu" },
+                net_name: &net.name,
+                points: &[(55.5, 45.5), (214.5, 45.5), (214.5, 144.5), (55.5, 144.5)],
+                clearance_mm: 0.3,
+                min_thickness_mm: 0.25,
+                name,
+                priority: 1,
+                connection: ZoneConnectionStyle::ZcsFull,
+            },
+            net.netcode,
+        );
+        let items = client
+            .create_items_returning(vec![konnect_ipc::builders::pack_any(
+                &zone,
+                "kiapi.board.types.Zone",
+            )])
+            .expect("zone creation failed");
+        created.extend(
+            items
+                .iter()
+                .filter_map(|item| Zone::decode(item.value.as_slice()).ok())
+                .filter_map(|zone| zone.id.map(|id| id.value)),
+        );
+
+        client.refill_zones().expect("refill request failed");
+        // The control: without it this test passes against a KiCad that never
+        // gates anything, and proves nothing about the wait.
+        if client
+            .get_items(KiCadObjectType::KotPcbVia)
+            .is_err_and(|error| error.to_string().contains("AS_BUSY"))
+        {
+            busy_seen += 1;
+        }
+        client
+            .wait_for_board_ready(std::time::Duration::from_secs(30))
+            .expect("the board never became ready");
+        client.save_board().unwrap_or_else(|error| {
+            panic!("round {round}: a board called ready refused the save: {error:#}")
+        });
+    }
+    client
+        .wait_for_board_ready(std::time::Duration::from_secs(30))
+        .expect("the board never became ready after the last save");
+    client.delete_items(created).expect("zone cleanup failed");
+    client.save_board().expect("final restoring save failed");
+    assert!(
+        busy_seen > 0,
+        "KiCad answered every item read straight after a refill, so this run did not \
+         exercise the wait"
+    );
+}
+
 /// KiCad's stackup for the open board is the one its file declares (#716).
 ///
 /// The expectation is the board's own `(setup (stackup …))` block

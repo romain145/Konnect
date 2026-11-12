@@ -731,6 +731,22 @@ fn sheet_json(sheet: &cse::Sheet, project_name: &str) -> Value {
     })
 }
 
+/// The refusal when a project root's `.kicad_pro` cannot say which UUID its
+/// instance paths start with (see [`super::project_root_uuid`]).
+fn root_uuid_unreadable(schematic: &Path, reason: &str) -> CallToolResult {
+    let project_file = schematic.with_extension("kicad_pro");
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::Conflict {
+            paths: vec![project_file.display().to_string()],
+        },
+        format!(
+            "Cannot read the root sheet UUID for '{}' from '{}': {reason}. Nothing was written.",
+            schematic.display(),
+            project_file.display()
+        ),
+    )
+}
+
 fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
     let tree = parse_sexp(source)?;
     if let Some(uuid) = tree.find_str("uuid") {
@@ -1192,8 +1208,12 @@ async fn handle_add_hierarchical_sheet(
         ));
     }
     let page = next_free_page(&parent, &project_name).to_string();
-    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let (parent_base, own_uuid) = ensure_source_root_uuid(&parent_before)?;
     let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
+    let root_uuid = match super::hierarchy_root_uuid(&parent_path, &own_uuid) {
+        Ok(uuid) => uuid,
+        Err(reason) => return Ok(root_uuid_unreadable(&parent_path, &reason)),
+    };
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &sheet_name,
@@ -1516,8 +1536,12 @@ async fn handle_duplicate_sheet(
 
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
     let page = next_free_page(&parent, &project_name).to_string();
-    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let (parent_base, own_uuid) = ensure_source_root_uuid(&parent_before)?;
     let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
+    let root_uuid = match super::hierarchy_root_uuid(&sch_path, &own_uuid) {
+        Ok(uuid) => uuid,
+        Err(reason) => return Ok(root_uuid_unreadable(&sch_path, &reason)),
+    };
     let root_path = format!("/{root_uuid}");
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &new_name,
@@ -1687,7 +1711,10 @@ async fn handle_renumber_sheet_pages(
     // matching what eeschema writes.
     let root_before = read_consistent(&root_path)?;
     let (root_base, root_uuid) = ensure_source_root_uuid(&root_before)?;
-    let root_prefix = format!("/{root_uuid}");
+    let root_prefix = match super::hierarchy_root_uuid(&root_path, &root_uuid) {
+        Ok(uuid) => format!("/{uuid}"),
+        Err(reason) => return Ok(root_uuid_unreadable(&root_path, &reason)),
+    };
 
     let mut next_page = 2u32; // page 1 is always the root, left untouched
     let mut renumbered = Vec::new();
@@ -5029,6 +5056,67 @@ mod tests {
             std::fs::read_to_string(&root).unwrap(),
             before,
             "delete_sheet must leave the real KiCad file byte-identical"
+        );
+    }
+
+    /// A project root whose `.kicad_pro` records a top-level sheet UUID has
+    /// its new, duplicated and renumbered sheets keyed to that UUID, as
+    /// eeschema keys them, and its own `(uuid …)` left alone (#166).
+    #[tokio::test]
+    async fn sheet_writers_root_paths_at_the_project_top_level_uuid() {
+        use crate::tools::schematic_target_tests::{
+            native_project, set_top_level_sheets, HEADER_UUID, PROJECT_UUID,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _) = native_project(dir.path());
+        set_top_level_sheets(
+            &root,
+            json!([{"filename": "complex_hierarchy.kicad_sch", "name": "", "uuid": PROJECT_UUID}]),
+        );
+        let ctx = test_ctx();
+        let schematic = root.display().to_string();
+        let paths = |name: &str| -> Vec<String> {
+            cse::Schematic::load(&root)
+                .unwrap()
+                .sheets
+                .by_name(name)
+                .unwrap()
+                .instances
+                .iter()
+                .map(|instance| instance.path.clone())
+                .collect()
+        };
+
+        let result = handle_add_hierarchical_sheet(
+            &json!({"schematic": schematic, "sheet_file": "leaf.kicad_sch",
+                    "sheet_name": "Leaf", "x": 250.0, "y": 50.0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(paths("Leaf"), [format!("/{PROJECT_UUID}")]);
+
+        let result = handle_duplicate_sheet(
+            &json!({"schematic": schematic, "source_sheet_name": "Leaf",
+                    "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(paths("Copy"), [format!("/{PROJECT_UUID}")]);
+
+        let result = handle_renumber_sheet_pages(&json!({"schematic": schematic}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        for name in ["Leaf", "Copy"] {
+            assert_eq!(paths(name), [format!("/{PROJECT_UUID}")], "{name}");
+        }
+        assert_eq!(
+            cse::Schematic::load(&root).unwrap().uuid.as_deref(),
+            Some(HEADER_UUID)
         );
     }
 }

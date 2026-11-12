@@ -54,6 +54,8 @@ mod schematic_placement_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
+#[cfg(test)]
+mod wiring_guard_tests;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
@@ -1324,6 +1326,30 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
     }
 }
 
+/// The stub directions a writer may try, in order. A named direction is the
+/// only one. `"auto"` leads with [`stub_direction`]'s choice and then, when it
+/// would join another net, the two directions across it (#157): never back
+/// over the symbol body. With no outward direction there is no body to avoid,
+/// so the other three follow.
+pub(crate) fn stub_directions(direction: &str, outward: Option<f64>) -> Vec<StubDirection> {
+    let first = stub_direction(direction, outward);
+    if direction != "auto" {
+        return vec![first];
+    }
+    let opposite = |a: f64, b: f64| ((a - b).rem_euclid(360.0) - 180.0).abs() < 1e-9;
+    let first_angle = STUB_DIRECTIONS
+        .iter()
+        .find(|row| row.0 == first.name)
+        .map_or(0.0, |row| row.3);
+    let rest: Vec<StubDirection> = STUB_DIRECTIONS
+        .iter()
+        .filter(|row| row.0 != first.name)
+        .filter(|row| outward.is_none() || !opposite(row.3, first_angle))
+        .map(|row| stub_direction(row.0, outward))
+        .collect();
+    std::iter::once(first).chain(rest).collect()
+}
+
 /// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is
 /// exact; matching one by position gives up when stacked pins there disagree.
 pub(crate) fn resolve_stub_direction(
@@ -2174,9 +2200,19 @@ pub(crate) fn resolve_schematic_ownership(
             complete = false;
             continue;
         };
-        let Some(root_uuid) = root.uuid.clone() else {
-            complete = false;
-            continue;
+        let root_uuid = match project_root_uuid(&project_file, &root_schematic) {
+            Ok(Some(uuid)) => uuid,
+            Ok(None) => match root.uuid.clone() {
+                Some(uuid) => uuid,
+                None => {
+                    complete = false;
+                    continue;
+                }
+            },
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
 
         let mut instance_paths = Vec::new();
@@ -2214,6 +2250,78 @@ pub(crate) fn resolve_schematic_ownership(
         });
     }
     Ok(owners.pop())
+}
+
+/// The root sheet UUID that `project_file` records for `root_schematic`, or
+/// `None` when it records none, or only the nil UUID.
+///
+/// KiCad 10 can keep the root sheet's UUID in the project file, at
+/// `schematic.top_level_sheets[].uuid`. eeschema's project loader keeps that
+/// UUID for the loaded sheet unless it is nil, even with a single top-level
+/// sheet, so every instance path it writes starts with it rather than with the
+/// root schematic's own `(uuid …)`. Rooting paths at the schematic's UUID
+/// refused such a project's own paths as stale (#166).
+///
+/// A project file that is not JSON records nothing, as eeschema reads it: its
+/// settings fall back to their defaults. `Err` when the file cannot be read,
+/// or `top_level_sheets` is malformed or gives this schematic two UUIDs.
+pub(crate) fn project_root_uuid(
+    project_file: &std::path::Path,
+    root_schematic: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let source = std::fs::read(project_file).map_err(|error| error.to_string())?;
+    let Ok(project) = serde_json::from_slice::<serde_json::Value>(&source) else {
+        return Ok(None);
+    };
+    let Some(sheets) = project.pointer("/schematic/top_level_sheets") else {
+        return Ok(None);
+    };
+    let sheets = sheets
+        .as_array()
+        .ok_or("schematic.top_level_sheets is not an array")?;
+    let directory = project_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut found: Option<String> = None;
+    for sheet in sheets {
+        let filename = sheet["filename"]
+            .as_str()
+            .ok_or("a top-level sheet has no filename")?;
+        if !same_schematic_document(&directory.join(filename), root_schematic) {
+            continue;
+        }
+        let uuid = sheet["uuid"]
+            .as_str()
+            .ok_or_else(|| format!("top-level sheet '{filename}' has no uuid"))?;
+        let uuid = uuid::Uuid::parse_str(uuid)
+            .map_err(|error| format!("top-level sheet '{filename}' uuid: {error}"))?;
+        if uuid.is_nil() {
+            continue;
+        }
+        let uuid = uuid.to_string();
+        if found.as_ref().is_some_and(|previous| previous != &uuid) {
+            return Err(format!(
+                "top-level sheets give '{filename}' two different UUIDs"
+            ));
+        }
+        found = Some(uuid);
+    }
+    Ok(found)
+}
+
+/// The UUID the instance paths below `schematic` start with, when it is a
+/// project's root: the project's top-level sheet UUID when it records one
+/// ([`project_root_uuid`]), otherwise `own_uuid`, the schematic's `(uuid …)`.
+/// A schematic with no `<stem>.kicad_pro` beside it answers `own_uuid`.
+pub(crate) fn hierarchy_root_uuid(
+    schematic: &std::path::Path,
+    own_uuid: &str,
+) -> Result<String, String> {
+    let project_file = schematic.with_extension("kicad_pro");
+    if !project_file.is_file() {
+        return Ok(own_uuid.to_string());
+    }
+    Ok(project_root_uuid(&project_file, schematic)?.unwrap_or_else(|| own_uuid.to_string()))
 }
 
 fn collect_sheet_instance_paths(
@@ -2975,6 +3083,108 @@ pub(crate) mod schematic_target_tests {
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
         );
+    }
+
+    /// The demo root's own `(uuid …)`, and a project-file UUID that differs.
+    pub(crate) const HEADER_UUID: &str = "5b9623a5-6d01-41fc-9865-e1bc779418c8";
+    pub(crate) const PROJECT_UUID: &str = "b17a773a-65cc-45fc-a3bd-749216d1b68c";
+
+    /// Set `schematic.top_level_sheets` in the project file beside `root`.
+    pub(crate) fn set_top_level_sheets(root: &Path, sheets: Value) {
+        let project_file = root.with_extension("kicad_pro");
+        let mut project: Value =
+            serde_json::from_slice(&std::fs::read(&project_file).unwrap()).unwrap();
+        project["schematic"]["top_level_sheets"] = sheets;
+        std::fs::write(&project_file, serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+    }
+
+    /// eeschema keys every instance path to a non-nil top-level sheet UUID
+    /// from the project file, even with one top-level sheet (#166).
+    #[test]
+    fn a_project_top_level_uuid_roots_the_instance_paths() {
+        for others in [
+            vec![],
+            vec![
+                serde_json::json!({"filename": "other.kicad_sch", "name": "other", "uuid": "cfe4c476-7f56-4ff2-a3e3-2636d6353164"}),
+            ],
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, child) = native_project(directory.path());
+            let mut sheets = others.clone();
+            sheets.push(serde_json::json!({
+                "filename": "complex_hierarchy.kicad_sch", "name": "", "uuid": PROJECT_UUID
+            }));
+            set_top_level_sheets(&root, Value::Array(sheets));
+            assert_eq!(
+                resolve_schematic_ownership(&root)
+                    .unwrap()
+                    .unwrap()
+                    .instance_paths,
+                [format!("/{PROJECT_UUID}")]
+            );
+            assert_eq!(
+                resolve_schematic_ownership(&child)
+                    .unwrap()
+                    .unwrap()
+                    .instance_paths,
+                [
+                    format!("/{PROJECT_UUID}/00000000-0000-0000-0000-00004b3a1333"),
+                    format!("/{PROJECT_UUID}/00000000-0000-0000-0000-00004b3a13a4"),
+                ]
+            );
+            // Resolving never rewrites the schematic's own UUID.
+            assert_eq!(
+                konnect_schematic_editor::Schematic::load(&root)
+                    .unwrap()
+                    .uuid
+                    .as_deref(),
+                Some(HEADER_UUID)
+            );
+        }
+    }
+
+    /// No entry, a nil one, or one for another file: the schematic's own
+    /// UUID, as before. A malformed entry proves nothing and is a conflict.
+    #[test]
+    fn a_project_without_a_usable_top_level_uuid_falls_back_or_refuses() {
+        let header_paths = [format!("/{HEADER_UUID}")];
+        for sheets in [
+            serde_json::json!([]),
+            serde_json::json!([{"filename": "complex_hierarchy.kicad_sch", "uuid": "00000000-0000-0000-0000-000000000000"}]),
+            serde_json::json!([{"filename": "other.kicad_sch", "uuid": PROJECT_UUID}]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, _) = native_project(directory.path());
+            set_top_level_sheets(&root, sheets.clone());
+            assert_eq!(
+                resolve_schematic_ownership(&root)
+                    .unwrap()
+                    .unwrap()
+                    .instance_paths,
+                header_paths,
+                "{sheets}"
+            );
+        }
+        for sheets in [
+            serde_json::json!("not a list"),
+            serde_json::json!([{"filename": "complex_hierarchy.kicad_sch", "uuid": "not a uuid"}]),
+            serde_json::json!([{"filename": "complex_hierarchy.kicad_sch"}]),
+            serde_json::json!([
+                {"filename": "complex_hierarchy.kicad_sch", "uuid": PROJECT_UUID},
+                {"filename": "complex_hierarchy.kicad_sch", "uuid": "cfe4c476-7f56-4ff2-a3e3-2636d6353164"}
+            ]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, _) = native_project(directory.path());
+            set_top_level_sheets(&root, sheets.clone());
+            assert!(
+                matches!(
+                    resolve_schematic_ownership(&root),
+                    Err(SchematicTargetError::ProjectConflict { .. })
+                ),
+                "{sheets}"
+            );
+        }
     }
 }
 

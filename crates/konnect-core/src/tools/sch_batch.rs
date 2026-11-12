@@ -25,7 +25,7 @@ use konnect_sexp::{
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
+use super::sch_connectivity::{ConnectivityIndex, NetJoinGuard, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
@@ -33,7 +33,8 @@ use super::sch_components::{
     plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, plan_wire, resolve_pin_endpoint, resolve_placed_pin,
+    route_between, stub_label, wiring_blocked, PinTargetError, StubPlan,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -49,7 +50,11 @@ pub fn tools() -> Vec<ToolDef> {
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
-             global labels are one net across all sheets and instances.",
+             global labels are one net across all sheets and instances. \
+             A pin whose stub or label would join another net, or whose reference names \
+             more than one placed pin (or none), is skipped and listed in errors and in \
+             failures with its kind (plan_blocked, ambiguous_target, stale_target); the \
+             other pins are still connected.",
             json!({
                 "type": "object",
                 "properties": {
@@ -60,7 +65,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "direction": {
                         "type": "string",
                         "description": "Direction of each pin's stub, and of its label text. 'auto' (default) \
-                                        points away from the symbol body.",
+                                        points away from the symbol body, or across the pin when that \
+                                        stub would join another net.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
@@ -129,7 +135,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle.",
+             file read/write cycle. Routes as connect_pins does; a pair whose route would \
+             join another net, or whose reference names more than one placed pin (or none), \
+             is skipped and listed in errors and in failures with its kind.",
             json!({
                 "type": "object",
                 "properties": {
@@ -466,11 +474,24 @@ async fn handle_batch_connect_to_net(
     } else {
         Vec::new()
     };
+    // Every stub and label is checked before it is kept: one that would join
+    // another net's pin, label or sheet pin is refused and listed, and the
+    // rest still land (#157).
+    let mut guard = match NetJoinGuard::new(&tree) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            return Ok(wiring_blocked(
+                "batch_connect_to_net",
+                vec![format!("cannot check what the stubs would join: {reason}")],
+            ))
+        }
+    };
     let mut is_changed = false;
 
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut failures: Vec<Value> = Vec::new();
     // Label positions already carrying this net, so a second never lands on
     // the first. Seeded from the file, extended as we go.
     let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
@@ -479,7 +500,7 @@ async fn handle_batch_connect_to_net(
         .map(|l| (l.x, l.y))
         .collect();
 
-    for pin_spec in &pins {
+    for (index, pin_spec) in pins.iter().enumerate() {
         let reference = match pin_spec["reference"].as_str() {
             Some(r) => r,
             None => {
@@ -498,27 +519,77 @@ async fn handle_batch_connect_to_net(
         let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
             Ok(p) => p,
             Err(e) => {
-                errors.push(e.to_string());
+                let message = format!("{reference} pin {pin_number}: {}", e.summary());
+                failures.push(pin_target_failure(
+                    index, reference, pin_number, &e, &message,
+                ));
+                errors.push(message);
                 continue;
             }
         };
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
-        // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
-        let (lx, ly) = dir.end((px, py), stub_length);
-        let rotation = dir.label_rotation;
-
-        // Symbols stack several pins on one endpoint; a label each renders as
-        // a smear. They stay connected by that endpoint. Two stubs can also
-        // end on one spot, so the label is judged apart from this pin's wire.
-        let needs_label = !labelled
-            .iter()
-            .any(|(x, y)| points_coincident(*x, *y, lx, ly, 0.01));
-        let needs_wire = match sch.as_ref() {
-            Some(sch) if stub_length > 0.0 => !has_wire(sch, (px, py), (lx, ly)),
-            _ => false,
+        // is unchanged. It falls back across the pin when that stub would
+        // join another net.
+        let candidates =
+            crate::tools::stub_directions(direction, Some(pin_outward_direction(&pin, t)));
+        guard.forget_allowed();
+        guard.allow_point((px, py));
+        guard.allow_net(&net_name);
+        let mut refused = Vec::new();
+        let mut chosen = None;
+        for dir in candidates {
+            let (lx, ly) = dir.end((px, py), stub_length);
+            // Symbols stack several pins on one endpoint; a label each renders
+            // as a smear. They stay connected by that endpoint. Two stubs can
+            // also end on one spot, so the label is judged apart from this
+            // pin's wire.
+            let needs_label = !labelled
+                .iter()
+                .any(|(x, y)| points_coincident(*x, *y, lx, ly, 0.01));
+            let stub = StubPlan {
+                end: (lx, ly),
+                wire: match sch.as_ref() {
+                    Some(sch) if stub_length > 0.0 && !has_wire(sch, (px, py), (lx, ly)) => {
+                        Some(plan_wire(sch, &pin_points, (px, py), (lx, ly)))
+                    }
+                    _ => None,
+                },
+                label: needs_label
+                    .then(|| stub_label(label_type, &net_name, (lx, ly), dir.label_rotation)),
+            };
+            let joins = guard.joins(&stub.additions());
+            if joins.is_empty() {
+                chosen = Some((dir, stub));
+                break;
+            }
+            refused.push(format!(
+                "{}: the stub would join {}",
+                dir.name,
+                joins.join("; ")
+            ));
+        }
+        let Some((dir, stub)) = chosen else {
+            let message = format!(
+                "{reference} pin {pin_number}: refused, nothing written for it: {}",
+                refused.join("; ")
+            );
+            failures.push(json!({
+                "index": index,
+                "reference": reference,
+                "pin": pin_number,
+                "kind": "plan_blocked",
+                "reasons": refused,
+                "message": message
+            }));
+            errors.push(message);
+            continue;
         };
+        let (lx, ly) = stub.end;
+        let rotation = dir.label_rotation;
+        let needs_label = stub.label.is_some();
+        let needs_wire = stub.wire.is_some();
+        guard.absorb(stub.additions());
         if needs_wire {
             if let Some(sch) = sch.as_mut() {
                 add_stub_wire(sch, &pin_points, (px, py), (lx, ly));
@@ -546,6 +617,10 @@ async fn handle_batch_connect_to_net(
             entry["label"] = json!({ "x": lx, "y": ly, "rotation": rotation });
             if needs_wire {
                 entry["wire"] = json!({ "x1": px, "y1": py, "x2": lx, "y2": ly });
+            }
+            // Why `auto` did not take the outward direction.
+            if !refused.is_empty() {
+                entry["skipped_directions"] = json!(refused);
             }
         }
         if duplicate {
@@ -576,11 +651,38 @@ async fn handle_batch_connect_to_net(
         "added_count": added.len(),
         "errors": errors
     });
+    // Each refused pin with its error kind; absent when none was refused.
+    if !failures.is_empty() {
+        body["failures"] = json!(failures);
+    }
     if !is_legacy_placement {
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
     Ok(CallToolResult::json(&body))
+}
+
+/// A batch item refused because its pin name did not pick out one placed pin,
+/// with the kind and evidence `connect_to_net` would return for it (#98).
+fn pin_target_failure(
+    index: usize,
+    reference: &str,
+    pin_number: &str,
+    error: &PinTargetError,
+    message: &str,
+) -> Value {
+    let mut failure = json!({
+        "index": index,
+        "reference": reference,
+        "pin": pin_number,
+        "kind": error.kind(),
+        "message": message
+    });
+    match error {
+        PinTargetError::Stale { reason, .. } => failure["reason"] = json!(reason),
+        PinTargetError::Ambiguous { candidates, .. } => failure["candidates"] = json!(candidates),
+    }
+    failure
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -856,9 +958,12 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    // (index in `connections`, "R1.2 -> R2.1", pin 1's tip, pin 2's tip)
+    type Pair = (usize, String, (f64, f64), (f64, f64));
+    let mut resolved: Vec<Pair> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for conn in &connections {
+    let mut failures: Vec<Value> = Vec::new();
+    for (index, conn) in connections.iter().enumerate() {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
             conn["ref1"].as_str(),
             conn["pin1"].as_str(),
@@ -868,30 +973,79 @@ async fn handle_batch_connect_pins(
             errors.push("Missing ref1/pin1/ref2/pin2 in connection spec".into());
             continue;
         };
+        let pair = format!("{ref1}.{pin1} -> {ref2}.{pin2}");
         match (
             resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
             resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
-            (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
+            (Ok(a), Ok(b)) => resolved.push((index, pair, a, b)),
+            (Err(e), _) | (_, Err(e)) => {
+                let message = format!("{pair}: {}", e.summary());
+                let mut failure = json!({
+                    "index": index,
+                    "connection": pair,
+                    "kind": e.kind(),
+                    "message": message
+                });
+                match &e {
+                    PinTargetError::Stale { target, reason } => {
+                        failure["target"] = json!(target);
+                        failure["reason"] = json!(reason);
+                    }
+                    PinTargetError::Ambiguous { target, candidates } => {
+                        failure["target"] = json!(target);
+                        failure["candidates"] = json!(candidates);
+                    }
+                }
+                failures.push(failure);
+                errors.push(message);
+            }
         }
     }
 
-    // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
+    // ponytail: re-parses content and rebuilds the net graph per pair;
+    // incremental tree edits if batches get huge.
+    // A route that would join another net is skipped and listed; the rest
+    // still land, as an unresolved pin's do (#145).
     let mut new_content = content;
-    for (x1, y1, x2, y2) in &resolved {
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+    let mut connected = 0usize;
+    for (index, pair, a, b) in &resolved {
+        match route_between(&new_content, *a, *b)? {
+            Ok(routed) => {
+                new_content = routed.content;
+                connected += 1;
+            }
+            Err(reasons) => {
+                let message = format!(
+                    "{pair}: refused, nothing written for it: {}",
+                    reasons.join("; ")
+                );
+                failures.push(json!({
+                    "index": index,
+                    "connection": pair,
+                    "kind": "plan_blocked",
+                    "reasons": reasons,
+                    "message": message
+                }));
+                errors.push(message);
+            }
+        }
     }
 
-    if !resolved.is_empty() {
+    if connected > 0 {
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
-    let mut result = CallToolResult::json(&json!({
-        "connected_count": resolved.len(),
+    let mut body = json!({
+        "connected_count": connected,
         "errors": errors
-    }));
-    result.is_error = resolved.is_empty() && !errors.is_empty();
+    });
+    // Each refused pair with its error kind; absent when none was refused.
+    if !failures.is_empty() {
+        body["failures"] = json!(failures);
+    }
+    let mut result = CallToolResult::json(&body);
+    result.is_error = connected == 0 && !errors.is_empty();
     Ok(result)
 }
 
@@ -925,8 +1079,9 @@ fn is_deletable_schematic_tag(tag: &str) -> bool {
 /// `sym_start..sym_end` by `(ddx, ddy)`.
 ///
 /// A property's own rotation is left untouched: a translation does not turn
-/// text. Block starts come from `find_block_starts`, which is string-aware, so
-/// a property *value* containing `(property` cannot be mistaken for one.
+/// text. Each property is a direct child of the symbol, and its anchor the
+/// direct `(at …)` child of the property, so a name or value containing
+/// `(property` or `(at ` is never taken for one (#111).
 fn property_translation_edits(
     content: &str,
     sym_start: usize,
@@ -934,28 +1089,23 @@ fn property_translation_edits(
     ddx: f64,
     ddy: f64,
 ) -> Vec<SexpEdit> {
+    use konnect_sexp::writer::direct_children_with_tag;
     if ddx == 0.0 && ddy == 0.0 {
         return Vec::new();
     }
+    let symbol = &content[sym_start..sym_end];
     let mut edits = Vec::new();
-    for prop_start in konnect_sexp::writer::find_block_starts(content, "property") {
-        if prop_start < sym_start || prop_start >= sym_end {
-            continue;
-        }
-        let Some((_, prop_end)) = konnect_sexp::writer::find_balanced_block(content, prop_start)
+    for (prop_start, prop_end) in direct_children_with_tag(symbol, "symbol", "property") {
+        let prop = &symbol[prop_start..prop_end];
+        let Some((at_start, at_end)) = direct_children_with_tag(prop, "property", "at")
+            .into_iter()
+            .next()
         else {
             continue;
         };
-        let prop = &content[prop_start..prop_end];
-        // The property's own (at …), not one nested deeper in (effects …).
-        let Some(at_rel) = prop.find("(at ") else {
-            continue;
-        };
-        let at_abs = prop_start + at_rel + "(at ".len();
-        let Some(close_rel) = prop[at_rel..].find(')') else {
-            continue;
-        };
-        let at_end = prop_start + at_rel + close_rel;
+        // Between the `(at` head and the closing parenthesis.
+        let at_abs = sym_start + prop_start + at_start + "(at".len();
+        let at_end = sym_start + prop_start + at_end - 1;
         let parts: Vec<&str> = content[at_abs..at_end].split_whitespace().collect();
         let (Some(px), Some(py)) = (
             parts.first().and_then(|s| s.parse::<f64>().ok()),
@@ -968,7 +1118,7 @@ fn property_translation_edits(
             at_abs,
             at_end,
             format!(
-                "{} {} {rot}",
+                " {} {} {rot}",
                 cse::types::fmt_f64(px + ddx),
                 cse::types::fmt_f64(py + ddy)
             ),
@@ -1017,19 +1167,19 @@ async fn handle_bulk_move(
 
         let mut placements: Vec<serde_json::Value> = Vec::new();
         for (sym_start, sym_end) in blocks {
-            // Find first (at X Y [ROT]) inside this symbol block
+            // The symbol's own (at X Y [ROT]): its direct child, not the
+            // first `(at ` in the text, which a lib_id can hold (#111).
             let sym_block = &content[sym_start..sym_end];
-            let at_pat = "(at ";
-            let at_rel = match sym_block.find(at_pat) {
-                Some(r) => r,
-                None => {
-                    errors.push(format!("No (at) in symbol '{}'", reference));
-                    continue;
-                }
+            let Some((at_rel, at_close)) =
+                konnect_sexp::writer::direct_children_with_tag(sym_block, "symbol", "at")
+                    .into_iter()
+                    .next()
+            else {
+                errors.push(format!("No (at) in symbol '{}'", reference));
+                continue;
             };
-            let at_abs = sym_start + at_rel + at_pat.len();
-            let close_rel = sym_block[at_rel..].find(')').unwrap_or(0);
-            let at_end = sym_start + at_rel + close_rel;
+            let at_abs = sym_start + at_rel + "(at".len();
+            let at_end = sym_start + at_close - 1;
 
             let at_str = &content[at_abs..at_end];
             let parts: Vec<&str> = at_str.split_whitespace().collect();
@@ -1050,7 +1200,7 @@ async fn handle_bulk_move(
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
-                format!("{new_x} {new_y} {rot}"),
+                format!(" {new_x} {new_y} {rot}"),
             ));
             // Property coordinates are ABSOLUTE in .kicad_sch, so the field
             // text does not follow the symbol on its own — moving only the
@@ -2627,6 +2777,9 @@ mod batch_place_and_connect_tests {
 
     /// Six single-pin instances of a synthetic part, positioned so that
     /// connecting them by pin pairs produces a T-junction on the second pair.
+    /// R4's pin lies on the R1-R2 route, so a label `N` on R1 and on R4 puts
+    /// it on R1's net already: without them that route would join R4 and be
+    /// refused (#145).
     fn multi_point_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
         let pin_def = "\t\t\t(pin passive line (at 0 0 0) (length 0)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n";
         let lib_sym = format!("\t\t(symbol \"Test:PT\"\n{pin_def}\t\t)\n");
@@ -2635,13 +2788,16 @@ mod batch_place_and_connect_tests {
                 "\t(symbol\n\t\t(lib_id \"Test:PT\")\n\t\t(at {x} {y} 0)\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
             )
         };
+        let label = |x: f64, y: f64| format!("\t(label \"N\"\n\t\t(at {x} {y} 0)\n\t)\n");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("points.kicad_sch");
         std::fs::write(
             &path,
             format!(
-                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{})\n",
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{}{}{})\n",
                 lib_sym,
+                label(100.0, 100.0),
+                label(110.0, 100.0),
                 inst("R1", 100.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000001"),
                 inst("R2", 120.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000002"),
                 inst("R3", 110.0, 80.0, "aaaaaaaa-0000-0000-0000-000000000003"),

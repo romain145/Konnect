@@ -2321,6 +2321,7 @@ impl KiCadIpcClient {
         if items.is_empty() {
             return Ok(());
         }
+        self.refuse_footprint_updates_that_drop_children(&document, &items)?;
         let expected_count = items.len();
         let header = header_for(document);
         let cmd = kiapi::common::commands::UpdateItems {
@@ -2352,6 +2353,64 @@ impl KiCadIpcClient {
             }
         }
         Ok(())
+    }
+
+    /// Refuse an update that would make KiCad drop what a footprint owns.
+    ///
+    /// KiCad's API updates a footprint by replacing it with one built from the
+    /// `FootprintInstance` sent. Seen on KiCad 10.0.8 with
+    /// `footprint_children_kicad10.kicad_pcb`: changing U1's value this way
+    /// removed U1's own group and its `NoTimer` design variant from the board,
+    /// and the call reported success. The message carries neither, and no item
+    /// read lists them, so the board as KiCad writes it is the only place they
+    /// can be seen.
+    ///
+    /// A point the message carries is kept, as KiCad 10.0.8 sends the stock
+    /// footprints' points; one it does not carry is lost too.
+    ///
+    /// The update goes ahead when that text cannot be read: a KiCad that will
+    /// not serialise the board is the state before this check existed, not
+    /// evidence of a loss. Only an update that sends a footprint reads it.
+    fn refuse_footprint_updates_that_drop_children(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        items: &[prost_types::Any],
+    ) -> Result<()> {
+        use crate::footprint_children::{updates_dropping_children, SentFootprint};
+
+        let sent = items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.FootprintInstance"))
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .filter_map(|footprint| {
+                Some(SentFootprint {
+                    reference: footprint_reference(&footprint).to_string(),
+                    carried_points: crate::footprint_children::reference_points_carried(&footprint),
+                    kiid: footprint.id?.value,
+                })
+            })
+            .collect::<Vec<_>>();
+        if sent.is_empty() {
+            return Ok(());
+        }
+        let board_text = match self.save_document_to_string_in(document.clone()) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::debug!("footprint children not checked before update: {error:#}");
+                return Ok(());
+            }
+        };
+        let dropped = updates_dropping_children(&board_text, &sent);
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{}. KiCad drops these when its API updates a footprint, so nothing was sent; \
+             make this change in KiCad, which edits the footprint in place",
+            dropped.join("; ")
+        )
     }
 
     /// Delete items by KIID.
@@ -2444,18 +2503,45 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Wait for the bound board to accept reads after an asynchronous operation.
+    /// Wait for the bound board to accept commands after an asynchronous
+    /// operation such as a zone refill.
     /// Only KiCad's explicit AS_BUSY response is retried; mutations are never replayed.
+    ///
+    /// The probe is an item read, because that is a command KiCad gates.
+    /// Measured on KiCad 10.0.8 during a refill: `GetOpenDocuments` and
+    /// `GetNets` are answered throughout, while `GetItems` and `SaveDocument`
+    /// are refused with AS_BUSY for the 0.2–0.4 s the fill takes on a small
+    /// board. Probing with `GetOpenDocuments` alone therefore called a board
+    /// ready that then refused the save.
     pub fn wait_for_board_ready(&self, timeout: std::time::Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
+        let is_busy = |error: &anyhow::Error| {
+            ApiStatusError::from_error(error)
+                .is_some_and(|status| status.code == kiapi::common::ApiStatusCode::AsBusy as i32)
+        };
         loop {
-            match self.get_board_document() {
-                Ok(_) => return Ok(()),
+            let probe = self.get_board_document().and_then(|document| {
+                // Dimensions: a class every board accepts and few boards fill.
+                let command = kiapi::common::commands::GetItems {
+                    header: Some(header_for(document)),
+                    types: vec![kiapi::common::types::KiCadObjectType::KotPcbDimension as i32],
+                };
+                match self.send_command(&command, "kiapi.common.commands.GetItems") {
+                    Ok(_) => Ok(()),
+                    // KiCad checks for busy before anything else, so any other
+                    // status it answers with came from a board that is not.
+                    Err(error)
+                        if !is_busy(&error) && ApiStatusError::from_error(&error).is_some() =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+            match probe {
+                Ok(()) => return Ok(()),
                 Err(error) => {
-                    let busy = ApiStatusError::from_error(&error).is_some_and(|status| {
-                        status.code == kiapi::common::ApiStatusCode::AsBusy as i32
-                    });
-                    if !busy || std::time::Instant::now() >= deadline {
+                    if !is_busy(&error) || std::time::Instant::now() >= deadline {
                         return Err(error.context("board readiness could not be established"));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2905,6 +2991,11 @@ impl KiCadIpcClient {
         let any = crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
         let created = self.create_items_returning(vec![any])?;
         self.refill_zones()?;
+        // KiCad refuses item reads and saves with AS_BUSY while it fills, so
+        // returning now would hand that refusal to whatever the caller does
+        // next. The zone exists either way: a wait that fails is not an error
+        // of this call, and the next command reports its own.
+        let _ = self.wait_for_board_ready(std::time::Duration::from_secs(30));
         // Discriminate on the declared type, never on whether a decode happens
         // to succeed — see `builders::any_is` for why that distinction cost
         // every synced footprint its graphics (#244).

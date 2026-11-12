@@ -794,6 +794,288 @@ impl<'a> ConnectivityIndex<'a> {
     }
 }
 
+// ─── Guarding a wiring write ──────────────────────────────────────────────────
+
+/// What a wiring write adds to a sheet, for [`NetJoinGuard::joins`] to see the
+/// nets after it without the write reaching the file.
+#[derive(Default)]
+pub(crate) struct WiringAdditions {
+    pub(crate) wires: Vec<Wire>,
+    pub(crate) junctions: Vec<(f64, f64)>,
+    pub(crate) labels: Vec<Label>,
+}
+
+/// A point that carries a net, and what sits on it: placed pins, labels (power
+/// symbols included) and sheet pins.
+struct Terminal {
+    at: (f64, f64),
+    items: Vec<String>,
+    /// The net the point is on before the write.
+    root: NetRoot,
+}
+
+/// A sheet's nets before a wiring write, kept so the write can be refused when
+/// it joins a net the caller did not name (#145, #157).
+///
+/// A write joins two nets when it puts terminals that were on different roots
+/// onto one. That is refused unless every one of those roots is allowed: the
+/// nets at the points the caller named ([`allow_point`](Self::allow_point)) and
+/// the net it asked for by name ([`allow_net`](Self::allow_net)). Bare wire
+/// ends are not terminals: a net of bare wires carries nothing to short.
+pub(crate) struct NetJoinGuard {
+    wires: Vec<Wire>,
+    labels: Vec<Label>,
+    junctions: Vec<(f64, f64)>,
+    sheet_pins: Vec<(f64, f64)>,
+    terminals: Vec<Terminal>,
+    /// Each terminal's index in `terminals`, by [`pt_key`].
+    terminal_at: HashMap<(i64, i64), usize>,
+    graph: NetGraph,
+    allowed: HashSet<NetRoot>,
+}
+
+fn label_kind_name(kind: LabelKind) -> &'static str {
+    match kind {
+        LabelKind::NetLabel => "label",
+        LabelKind::GlobalLabel => "global label",
+        LabelKind::HierarchicalLabel => "hierarchical label",
+        LabelKind::PowerSymbol => "power symbol",
+    }
+}
+
+impl NetJoinGuard {
+    /// `Err` when a placed symbol's pins cannot be resolved: the guard would
+    /// not see them, and a wire across them would join them unchecked.
+    pub(crate) fn new(tree: &SexpNode) -> Result<Self, &'static str> {
+        use konnect_sexp::schematic::{extract_all_net_labels, extract_wires, parse_at};
+        let placed = crate::tools::resolved_placed_pins_by_reference(tree)
+            .ok_or(crate::tools::UNRESOLVED_PIN_GEOMETRY)?;
+        let labels = extract_all_net_labels(tree);
+        let mut items: Vec<((f64, f64), String)> = Vec::new();
+        for (instance, pins) in &placed {
+            for (pin, transform) in pins {
+                items.push((
+                    pin_endpoint(pin, *transform),
+                    format!("{} pin {}", instance.reference, pin.number),
+                ));
+            }
+        }
+        for label in &labels {
+            items.push((
+                (label.x, label.y),
+                format!("{} {}", label_kind_name(label.kind), label.net),
+            ));
+        }
+        for pin in tree
+            .find_all("sheet")
+            .iter()
+            .flat_map(|sheet| sheet.find_all("pin"))
+        {
+            if let Some((x, y, _)) = parse_at(pin) {
+                let name = pin.get(1).and_then(SexpNode::as_str).unwrap_or("?");
+                items.push(((x, y), format!("sheet pin {name}")));
+            }
+        }
+        let wires = extract_wires(tree);
+        let mut guard = NetJoinGuard {
+            graph: NetGraph::new(),
+            wires,
+            labels,
+            junctions: extract_junctions(tree),
+            sheet_pins: extract_sheet_pins(tree),
+            terminals: Vec::new(),
+            terminal_at: HashMap::new(),
+            allowed: HashSet::new(),
+        };
+        for (at, item) in items {
+            guard.add_terminal(at, item);
+        }
+        guard.reseed();
+        Ok(guard)
+    }
+
+    fn add_terminal(&mut self, at: (f64, f64), item: String) {
+        match self.terminal_at.get(&pt_key(at.0, at.1)) {
+            Some(&index) => self.terminals[index].items.push(item),
+            None => {
+                self.terminal_at
+                    .insert(pt_key(at.0, at.1), self.terminals.len());
+                self.terminals.push(Terminal {
+                    at,
+                    items: vec![item],
+                    root: (0, 0),
+                });
+            }
+        }
+    }
+
+    /// Rebuild the graph and every terminal's root, forgetting what was allowed.
+    fn reseed(&mut self) {
+        self.graph = seed_net_graph(
+            &self.wires,
+            &self.labels,
+            &self.junctions,
+            &self.sheet_pins,
+            &WireIndex::build(&self.wires, COINCIDENT_TOLERANCE),
+        );
+        for terminal in &mut self.terminals {
+            terminal.root = self.graph.root_at(terminal.at.0, terminal.at.1);
+        }
+        self.allowed.clear();
+    }
+
+    /// Allow the net at `point`, and that of any wire it lies on: a wire that
+    /// ends mid-span on another is dotted there, so a point the caller named
+    /// on a wire asks for that wire.
+    pub(crate) fn allow_point(&mut self, (x, y): (f64, f64)) {
+        let root = self.graph.root_at(x, y);
+        self.allowed.insert(root);
+        let tapped: Vec<(f64, f64)> = self
+            .wires
+            .iter()
+            .filter(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, COINCIDENT_TOLERANCE))
+            .map(|w| (w.x1, w.y1))
+            .collect();
+        for (wx, wy) in tapped {
+            let root = self.graph.root_at(wx, wy);
+            self.allowed.insert(root);
+        }
+    }
+
+    /// Forget what was allowed, for the next item of a batch.
+    pub(crate) fn forget_allowed(&mut self) {
+        self.allowed.clear();
+    }
+
+    /// Allow every net a label named `net` is on.
+    pub(crate) fn allow_net(&mut self, net: &str) {
+        let points: Vec<(f64, f64)> = self
+            .labels
+            .iter()
+            .filter(|label| label.net == net)
+            .map(|label| (label.x, label.y))
+            .collect();
+        for (x, y) in points {
+            let root = self.graph.root_at(x, y);
+            self.allowed.insert(root);
+        }
+    }
+
+    /// Take a write that was kept into the sheet, so the next one in a batch
+    /// is judged against it. What was allowed is forgotten.
+    pub(crate) fn absorb(&mut self, added: WiringAdditions) {
+        for label in &added.labels {
+            self.add_terminal(
+                (label.x, label.y),
+                format!("{} {}", label_kind_name(label.kind), label.net),
+            );
+        }
+        self.wires.extend(added.wires);
+        self.junctions.extend(added.junctions);
+        self.labels.extend(added.labels);
+        self.reseed();
+    }
+
+    /// One line per net that `added` would join to another without being
+    /// allowed, empty when it joins none. Each line names the terminal the new
+    /// items touch where there is one, the net's name when it has one, and how
+    /// many more points that net carries.
+    pub(crate) fn joins(&self, added: &WiringAdditions) -> Vec<String> {
+        let wires: Vec<Wire> = self.wires.iter().chain(&added.wires).cloned().collect();
+        let labels: Vec<Label> = self.labels.iter().chain(&added.labels).cloned().collect();
+        let junctions: Vec<(f64, f64)> = self
+            .junctions
+            .iter()
+            .chain(&added.junctions)
+            .copied()
+            .collect();
+        let mut after = seed_net_graph(
+            &wires,
+            &labels,
+            &junctions,
+            &self.sheet_pins,
+            &WireIndex::build(&wires, COINCIDENT_TOLERANCE),
+        );
+
+        // The roots each net after the write is made of.
+        let mut merged: HashMap<NetRoot, BTreeSet<NetRoot>> = HashMap::new();
+        let after_roots: Vec<NetRoot> = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                let root = after.root_at(terminal.at.0, terminal.at.1);
+                merged.entry(root).or_default().insert(terminal.root);
+                root
+            })
+            .collect();
+        let joined: HashSet<NetRoot> = self
+            .terminals
+            .iter()
+            .zip(&after_roots)
+            .filter(|(terminal, after_root)| {
+                !self.allowed.contains(&terminal.root) && merged[*after_root].len() > 1
+            })
+            .map(|(terminal, _)| terminal.root)
+            .collect();
+
+        let touched = |(x, y): (f64, f64)| {
+            added
+                .wires
+                .iter()
+                .any(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, COINCIDENT_TOLERANCE))
+                || added
+                    .labels
+                    .iter()
+                    .any(|label| points_coincident(x, y, label.x, label.y, COINCIDENT_TOLERANCE))
+        };
+        let mut reported: Vec<NetRoot> = Vec::new();
+        let mut lines = Vec::new();
+        for terminal in &self.terminals {
+            if !joined.contains(&terminal.root) || reported.contains(&terminal.root) {
+                continue;
+            }
+            reported.push(terminal.root);
+            let on_net: Vec<&Terminal> = self
+                .terminals
+                .iter()
+                .filter(|other| other.root == terminal.root)
+                .collect();
+            let lead = on_net
+                .iter()
+                .find(|other| touched(other.at))
+                .copied()
+                .unwrap_or(terminal);
+            // A power symbol's own `#PWR` pin says nothing its label does not.
+            let mut items: Vec<&str> = lead
+                .items
+                .iter()
+                .filter(|item| !item.starts_with('#'))
+                .map(String::as_str)
+                .collect();
+            if items.is_empty() {
+                items = lead.items.iter().map(String::as_str).collect();
+            }
+            let mut line = format!(
+                "{} at ({}, {})",
+                items.join(" and "),
+                konnect_schematic_editor::types::fmt_f64(lead.at.0),
+                konnect_schematic_editor::types::fmt_f64(lead.at.1)
+            );
+            if let Some(name) = self.graph.name_of_root(terminal.root) {
+                line.push_str(&format!(" on net {name}"));
+            }
+            if on_net.len() > 1 {
+                line.push_str(&format!(
+                    " and {} more point(s) of that net",
+                    on_net.len() - 1
+                ));
+            }
+            lines.push(line);
+        }
+        lines
+    }
+}
+
 #[cfg(test)]
 mod agreement_tests {
     use super::*;

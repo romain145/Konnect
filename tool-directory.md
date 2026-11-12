@@ -117,8 +117,8 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_wire` | Add a wire segment (H or V) between two points. T-junctions are auto-detected and junction dots inserted. |
-| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. |
+| `add_wire` | Add a wire segment (H or V) between two points. The T-junctions the new wire makes are auto-detected and junction dots inserted; a T elsewhere on the sheet is left as it is. |
+| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle, each dotted at the T's it makes as `add_wire` does. |
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
@@ -134,9 +134,9 @@ and Windows servers do not.
 | `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
-| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
-| `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body, or across the pin when that stub would join another net. A stub that would join another net's pin, label or sheet pin is refused (`plan_blocked`); a reference naming more than one placed pin is `ambiguous_target`, a missing one `stale_target`. |
+| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire, H+V, V+H or a three-leg dogleg, never across another net's pin, label or sheet pin (`plan_blocked` when every route would). A reference naming more than one placed pin is `ambiguous_target`. |
+| `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing, V+H or a three-leg dogleg when that would join another net; `plan_blocked` when every route would). Use `connect_pins` if you have references instead of coordinates. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -177,7 +177,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. A pin it cannot connect safely is skipped and listed in `failures`. Single read → all edits → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID (`uuids`) or component reference designator (`references`) — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
@@ -188,7 +188,7 @@ and Windows servers do not.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
-| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
+| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. Routes as `connect_pins` does; a pair it refuses is skipped and listed in `failures`. |
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
@@ -240,7 +240,7 @@ and Windows servers do not.
 |------|-------------|
 | `set_board_size` | Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. Appends — clear the old edges with `delete_graphics` first. |
 | `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
-| `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
+| `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (generators on KiCad 10, and tables up to 10.0.6). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
 | `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |

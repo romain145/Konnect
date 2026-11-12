@@ -14,7 +14,10 @@ use konnect_sexp::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
         pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
+    writer::{
+        apply_edits, direct_children_with_tag, find_direct_child_blocks, write_atomic_if_unchanged,
+        SexpEdit,
+    },
     SexpError,
 };
 use serde_json::json;
@@ -191,6 +194,10 @@ pub fn tools() -> Vec<ToolDef> {
              and the sync proceeds for every other component. A library footprint that \
              cannot be placed, or a connected pad its footprint does not have, makes the dry \
              run a conflict whose diagnostics name the footprint and every part that needs it. \
+             So does an update of a footprint that owns groups or variants, or points KiCad \
+             did not send with it, which KiCad's API would drop. \
+             Only Exclude from board keeps a part off the board; Exclude from BOM and DNP are \
+             set on its footprint as KiCad's Update PCB does. \
              KiCad 10's API cannot carry a pad's fabrication property (heatsink, BGA, \
              mechanical, castellated, ...), so an added footprint whose library pads have \
              one is placed without it: `dropped_pad_properties` lists each such footprint, \
@@ -1125,17 +1132,6 @@ fn wire_block(content: &str, uuid: &str) -> Result<(usize, usize), ConnectivityT
                 .collect(),
         }),
     }
-}
-
-fn direct_children_with_tag(source: &str, parent: &str, tag: &str) -> Vec<(usize, usize)> {
-    find_direct_child_blocks(source, parent)
-        .into_iter()
-        .filter(|(start, end)| {
-            parse_sexp(&source[*start..*end])
-                .ok()
-                .is_some_and(|node| node.head() == Some(tag))
-        })
-        .collect()
 }
 
 fn wire_endpoint_block(

@@ -678,7 +678,7 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         json!({
             "board": board,
             "severity": "info",
-            "tests": ["lib_footprint_mismatch"],
+            "rules": ["lib_footprint_mismatch"],
             "limit": 100
         }),
     );
@@ -809,16 +809,24 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         "KiCad measured nothing: {live}"
     );
     assert_eq!(saved["skipped_item_count"], 0, "{saved}");
-    // KiCad 10 will not list tables or generators. The live answer names both
-    // with KiCad's own refusal instead of reading as complete (#688).
+    // KiCad 10 will not list generators, and up to 10.0.6 would not list
+    // tables either; 10.0.8 answers for tables. The live answer names each
+    // class KiCad refused, with KiCad's own refusal, instead of reading as
+    // complete (#688).
     let unavailable = live["unavailable_item_classes"]
         .as_array()
         .expect("the live answer names what KiCad would not list");
-    for class in ["tables", "generators"] {
-        let named = unavailable
+    assert!(
+        unavailable
             .iter()
-            .find(|entry| entry["class"] == class)
-            .unwrap_or_else(|| panic!("{class} is not named: {live}"));
+            .any(|entry| entry["class"] == "generators"),
+        "generators is not named: {live}"
+    );
+    for named in unavailable {
+        assert!(
+            named["class"] == "generators" || named["class"] == "tables",
+            "KiCad refused a class this test has not seen refused: {live}"
+        );
         assert_eq!(named["reason"], "refused", "{live}");
         assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
     }
