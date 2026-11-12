@@ -357,10 +357,18 @@ fn snapshot_routed_nets(
             }
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
+    let mut unreadable_zone = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        match super::pcb_sync::zone_net(item.value.as_slice()) {
+            super::pcb_sync::ZoneNet::Copper(net) => {
+                routed.insert(net);
+            }
+            super::pcb_sync::ZoneNet::None => {}
+            super::pcb_sync::ZoneNet::Unknown => unreadable_zone = true,
+        }
+    }
+    if unreadable_zone {
+        // A zone whose net cannot be read could be on any net.
         routed.extend(
             client
                 .get_nets_in(document)?
@@ -2210,6 +2218,38 @@ mod tests {
     use konnect_ipc::gen::kiapi;
     use prost::Message;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// A GND pour marks only GND as routed, so a removed pad on SIG is not
+    /// reported as cutting routed copper (#133). An unreadable zone still
+    /// marks every net.
+    #[test]
+    fn a_poured_board_counts_only_the_pour_net_as_routed() {
+        use super::super::pcb_sync::{
+            kicad_with_zones, zone_item, zone_without_net, GND_POUR, RULE_AREA,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("poured.kicad_pcb");
+        std::fs::write(
+            &board,
+            include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        let routed = |zones| {
+            let server = kicad_with_zones(&board, zones);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let document = client.find_open_board(&board).unwrap();
+            snapshot_routed_nets(&client, document).unwrap()
+        };
+
+        assert_eq!(
+            routed(vec![zone_item(GND_POUR), zone_item(RULE_AREA)]),
+            BTreeSet::from(["GND".to_string(), "VCC".to_string()])
+        );
+        assert_eq!(
+            routed(vec![zone_item(GND_POUR), zone_without_net()]),
+            BTreeSet::from(["GND".to_string(), "SIG".to_string(), "VCC".to_string()])
+        );
+    }
 
     /// The serialization KiCad 10 actually writes — produced by running this
     /// module's hand-written fixture through `kicad-cli fp upgrade` — parses,

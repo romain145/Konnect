@@ -1780,12 +1780,17 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
+    let mut unreadable_zone = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        match zone_net(item.value.as_slice()) {
+            ZoneNet::Copper(net) => *routed_nets.entry(net).or_insert(0) += 1,
+            ZoneNet::None => {}
+            ZoneNet::Unknown => unreadable_zone = true,
+        }
+    }
+    if unreadable_zone {
+        // A zone whose net cannot be read could be on any net, so a pad-net
+        // reassignment on this board fails closed.
         for net in net_codes.keys() {
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
@@ -1960,6 +1965,125 @@ fn board_layer_name(layer: i32) -> String {
         None => format!("layer_{layer}"),
     }
 }
+
+/// The net a KiCad zone puts copper on, read from `Zone.copper_settings.net`
+/// (#96, #133).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ZoneNet {
+    /// A copper zone on this net.
+    Copper(String),
+    /// A rule area, or a copper zone on no net: no net's copper.
+    None,
+    /// The zone could not be read, so it may be on any net.
+    Unknown,
+}
+
+pub(crate) fn zone_net(bytes: &[u8]) -> ZoneNet {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
+    match Zone::decode(bytes).map(|zone| zone.settings) {
+        Ok(Some(Settings::CopperSettings(copper))) => match copper.net {
+            Some(net) if !net.name.is_empty() => ZoneNet::Copper(net.name),
+            // KiCad names a zone's net, and writes "" for no net.
+            Some(_) => ZoneNet::None,
+            None => ZoneNet::Unknown,
+        },
+        Ok(Some(Settings::RuleAreaSettings(_))) => ZoneNet::None,
+        _ => ZoneNet::Unknown,
+    }
+}
+
+/// A KiCad holding `board` with nets VCC, GND and SIG, one VCC track, and
+/// `zones`, for the routed-net reads (#96, #133).
+#[cfg(test)]
+pub(crate) fn kicad_with_zones(
+    board: &Path,
+    zones: Vec<prost_types::Any>,
+) -> crate::test_support::MockIpcServer {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::builders::pack_any;
+    use konnect_ipc::gen::kiapi;
+
+    let net = |code, name: &str| kiapi::board::types::Net {
+        code: Some(kiapi::board::types::NetCode { value: code }),
+        name: name.to_string(),
+    };
+    let nets = vec![net(1, "VCC"), net(2, "GND"), net(3, "SIG")];
+    let track = pack_any(
+        &kiapi::board::types::Track {
+            id: Some(kiapi::common::types::Kiid {
+                value: "vcc-track".to_string(),
+            }),
+            net: Some(net(1, "VCC")),
+            ..Default::default()
+        },
+        "kiapi.board.types.Track",
+    );
+    super::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
+        if command.type_url.ends_with("GetItems") {
+            let request = kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                .expect("GetItems request");
+            let items = match request.types.first().copied().map(ObjectType::try_from) {
+                Some(Ok(ObjectType::KotPcbTrace)) => vec![track.clone()],
+                Some(Ok(ObjectType::KotPcbZone)) => zones.clone(),
+                _ => Vec::new(),
+            };
+            return Some(pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items,
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            ));
+        }
+        if command.type_url.ends_with("GetNets") {
+            return Some(pack_any(
+                &kiapi::board::commands::NetsResponse { nets: nets.clone() },
+                "kiapi.board.commands.NetsResponse",
+            ));
+        }
+        if command.type_url.ends_with("GetBoundingBox") {
+            return Some(super::pcb_board::board_mock::kicad_bounding_boxes(
+                command,
+                |_| (0.0, 0.0, 10.0, 10.0),
+            ));
+        }
+        None
+    })
+}
+
+/// A captured KiCad 10 zone item: a GND pour, a rule area, or bytes that do
+/// not decode.
+#[cfg(test)]
+pub(crate) fn zone_item(bytes: &[u8]) -> prost_types::Any {
+    prost_types::Any {
+        type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+        value: bytes.to_vec(),
+    }
+}
+
+/// A copper zone whose net KiCad did not send.
+#[cfg(test)]
+pub(crate) fn zone_without_net() -> prost_types::Any {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, CopperZoneSettings, Zone};
+    use konnect_ipc::gen::kiapi::common::types::Kiid;
+    zone_item(
+        &Zone {
+            id: Some(Kiid {
+                value: "netless-zone".to_string(),
+            }),
+            settings: Some(Settings::CopperSettings(CopperZoneSettings::default())),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) const GND_POUR: &[u8] =
+    include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin");
+#[cfg(test)]
+pub(crate) const RULE_AREA: &[u8] = include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin");
 
 fn record_routed_net(
     routed: &mut BTreeMap<String, usize>,
@@ -2813,6 +2937,64 @@ mod chunk_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zone_marks_only_its_own_net_as_routed() {
+        use konnect_ipc::gen::kiapi::board::types::{
+            zone::Settings, CopperZoneSettings, Net, Zone,
+        };
+        // Live KiCad 10 captures: a GND pour and a rule area (#96).
+        assert_eq!(zone_net(GND_POUR), ZoneNet::Copper("GND".to_string()));
+        assert_eq!(zone_net(RULE_AREA), ZoneNet::None);
+        let copper = |net: Option<Net>| {
+            Zone {
+                settings: Some(Settings::CopperSettings(CopperZoneSettings {
+                    net,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        let no_net = Net {
+            name: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(zone_net(&copper(Some(no_net))), ZoneNet::None);
+        // Fails closed when the zone's net can't be read.
+        assert_eq!(zone_net(&copper(None)), ZoneNet::Unknown);
+        assert_eq!(zone_net(&Zone::default().encode_to_vec()), ZoneNet::Unknown);
+        assert_eq!(zone_net(&[0xff, 0xff]), ZoneNet::Unknown);
+    }
+
+    /// A GND pour no longer marks VCC's neighbours as routed, so a pad on SIG
+    /// can change net (#96). An unreadable zone still fails closed.
+    #[test]
+    fn a_poured_board_counts_only_the_pour_net_as_routed() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("poured.kicad_pcb");
+        std::fs::write(
+            &board,
+            include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        let routed = |zones| {
+            let server = kicad_with_zones(&board, zones);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            snapshot_board(&client, &board).unwrap().state.routed_nets
+        };
+
+        assert_eq!(
+            routed(vec![zone_item(GND_POUR), zone_item(RULE_AREA)]),
+            BTreeMap::from([("GND".to_string(), 1), ("VCC".to_string(), 1)])
+        );
+        assert_eq!(
+            routed(vec![zone_item(GND_POUR), zone_without_net()])
+                .into_keys()
+                .collect::<Vec<_>>(),
+            ["GND", "SIG", "VCC"]
+        );
+    }
 
     const ONE_RESISTOR: &str = r#"
 (export
