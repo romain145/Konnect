@@ -54,6 +54,8 @@ mod schematic_placement_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
+#[cfg(test)]
+mod wiring_guard_tests;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
@@ -1322,6 +1324,30 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
         dy: row.2,
         label_rotation: horizontal_label_rotation(row.3),
     }
+}
+
+/// The stub directions a writer may try, in order. A named direction is the
+/// only one. `"auto"` leads with [`stub_direction`]'s choice and then, when it
+/// would join another net, the two directions across it (#157): never back
+/// over the symbol body. With no outward direction there is no body to avoid,
+/// so the other three follow.
+pub(crate) fn stub_directions(direction: &str, outward: Option<f64>) -> Vec<StubDirection> {
+    let first = stub_direction(direction, outward);
+    if direction != "auto" {
+        return vec![first];
+    }
+    let opposite = |a: f64, b: f64| ((a - b).rem_euclid(360.0) - 180.0).abs() < 1e-9;
+    let first_angle = STUB_DIRECTIONS
+        .iter()
+        .find(|row| row.0 == first.name)
+        .map_or(0.0, |row| row.3);
+    let rest: Vec<StubDirection> = STUB_DIRECTIONS
+        .iter()
+        .filter(|row| row.0 != first.name)
+        .filter(|row| outward.is_none() || !opposite(row.3, first_angle))
+        .map(|row| stub_direction(row.0, outward))
+        .collect();
+    std::iter::once(first).chain(rest).collect()
 }
 
 /// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is

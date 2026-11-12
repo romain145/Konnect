@@ -134,7 +134,16 @@ connect_pins(schematic, ref1, pin1, ref2, pin2)
 
 - Specify pins by pin number (from get_schematic_pin_locations)
 - Works best when pins are nearby and facing each other
-- Automatically creates wire segments with proper bends
+- Automatically creates wire segments with proper bends, horizontal leg first,
+  or vertical first when that leg would cross another net's pin, label or sheet
+  pin. When both bends would, a three-leg dogleg between the two pins is tried,
+  kept only if it crosses no symbol. When every route fails, the call is
+  refused with `plan_blocked` naming what is in the way, and nothing is
+  written: move a part or use
+  `connect_to_net` labels instead.
+- A reference placed twice (or a pin drawn on two placed units) is refused with
+  `ambiguous_target`, listing each candidate's unit, UUID and position. Annotate
+  first, or wire by coordinates with `add_schematic_connection`.
 
 ### connect_to_net
 
@@ -151,6 +160,10 @@ connect_to_net(schematic, reference, pin_number, net)
 - Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
   from the symbol body on its own, instead of the label text running back
   across the pin names. Override with `direction` only to fix a layout clash.
+- A stub that would land on another net's pin, label or sheet pin is never
+  drawn. With `direction: "auto"` the stub turns across the pin instead (the
+  response lists `skipped_directions`); with a named direction, or when every
+  direction is blocked, the call is refused with `plan_blocked`.
 - `batch_connect_to_net` does the same for many pins in one read/write. By
   default it places its labels directly on the pin endpoints without stubs;
   pass `stub_length`, `direction` and `label_type` for `connect_to_net`'s

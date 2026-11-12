@@ -1005,6 +1005,39 @@ pub fn find_t_junctions(wires: &[Wire], tol: f64) -> Vec<(f64, f64)> {
     junctions
 }
 
+/// The T's that adding `new` to `wires` makes: an end of `new` strictly inside
+/// one of `wires`, or an end of one of `wires` strictly inside `new`.
+///
+/// [`find_t_junctions`] answers for the whole sheet. A writer must not dot what
+/// it finds there: KiCad does not join a wire end that lands mid-span without a
+/// junction, so each junction-less T elsewhere on the sheet is two nets, and a
+/// dot would join them for a wire that never touched either (#158).
+pub fn find_t_junctions_on(wires: &[Wire], new: &Wire, tol: f64) -> Vec<(f64, f64)> {
+    let interior = |(px, py): (f64, f64), w: &Wire| {
+        point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol)
+            && !crate::geometry::points_coincident(px, py, w.x1, w.y1, tol)
+            && !crate::geometry::points_coincident(px, py, w.x2, w.y2, tol)
+    };
+    let mut junctions: Vec<(f64, f64)> = Vec::new();
+    let new_ends = [(new.x1, new.y1), (new.x2, new.y2)];
+    for w in wires {
+        let w_ends = [(w.x1, w.y1), (w.x2, w.y2)];
+        let tees = new_ends
+            .iter()
+            .filter(|&&end| interior(end, w))
+            .chain(w_ends.iter().filter(|&&end| interior(end, new)));
+        for &(px, py) in tees {
+            if !junctions
+                .iter()
+                .any(|&(jx, jy)| crate::geometry::points_coincident(px, py, jx, jy, tol))
+            {
+                junctions.push((px, py));
+            }
+        }
+    }
+    junctions
+}
+
 // ─── S-expression formatters for new elements ─────────────────────────────────
 
 pub fn format_wire(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
@@ -1783,5 +1816,50 @@ mod pin_label_rotation_tests {
         assert_eq!(horizontal_label_rotation(90.0), 0.0);
         assert_eq!(horizontal_label_rotation(270.0), 0.0);
         assert_eq!(horizontal_label_rotation(-180.0), 180.0);
+    }
+}
+
+#[cfg(test)]
+mod t_junction_tests {
+    use super::*;
+
+    fn wire(x1: f64, y1: f64, x2: f64, y2: f64) -> Wire {
+        Wire {
+            x1,
+            y1,
+            x2,
+            y2,
+            uuid: None,
+        }
+    }
+
+    /// The `tee` of #158: a wire ending mid-span on another with no dot. A new
+    /// wire far from it makes no T, and one that taps a wire makes one.
+    #[test]
+    fn only_the_tees_the_new_wire_makes_are_reported() {
+        let sheet = [
+            wire(177.8, 156.21, 203.2, 156.21),
+            wire(190.5, 143.51, 190.5, 156.21),
+        ];
+        let far = wire(20.32, 20.32, 30.48, 20.32);
+        let mut all = sheet.to_vec();
+        all.push(far.clone());
+        assert_eq!(find_t_junctions(&all, 0.01), vec![(190.5, 156.21)]);
+        assert!(find_t_junctions_on(&sheet, &far, 0.01).is_empty());
+
+        // An end of the new wire inside a wire, and a wire's end inside it.
+        let tap = wire(184.15, 143.51, 184.15, 156.21);
+        assert_eq!(
+            find_t_junctions_on(&sheet, &tap, 0.01),
+            vec![(184.15, 156.21)]
+        );
+        let across = wire(185.42, 143.51, 195.58, 143.51);
+        assert_eq!(
+            find_t_junctions_on(&sheet, &across, 0.01),
+            vec![(190.5, 143.51)]
+        );
+        // Meeting end to end is not a T.
+        let onward = wire(203.2, 156.21, 215.9, 156.21);
+        assert!(find_t_junctions_on(&sheet, &onward, 0.01).is_empty());
     }
 }

@@ -419,6 +419,28 @@ fn full_design_loop_with_real_kicad() {
         "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
     );
 
+    // R1 pin 2 → C1 pin 1 is bottom pin to top pin of two parts side by side:
+    // an L-bend runs down a pin column, and for a long time this call shorted
+    // C1 and the loop passed anyway. eeschema says what the wire joined.
+    let has_node = |block: &str, reference: &str, pin: &str| {
+        block.split("(node").any(|n| {
+            n.contains(&format!(r#"(ref "{reference}")"#))
+                && n.contains(&format!(r#"(pin "{pin}")"#))
+        })
+    };
+    let routed = netlist
+        .split("(net")
+        .find(|block| has_node(block, "C1", "1"))
+        .unwrap_or_else(|| panic!("eeschema's netlist has no net on C1 pin 1:\n{netlist}"));
+    assert!(
+        has_node(routed, "R1", "2"),
+        "connect_pins did not join R1 pin 2 to C1 pin 1:\n{routed}"
+    );
+    assert!(
+        !has_node(routed, "C1", "2") && !has_node(routed, "R1", "1"),
+        "connect_pins shorted a part it was wiring:\n{routed}"
+    );
+
     // The review's runtime coverage uses Konnect's parser so the tool remains
     // usable without kicad-cli. Cross-check that count here against KiCad's
     // own netlist so parser drift cannot turn incomplete extraction into a

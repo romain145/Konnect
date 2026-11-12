@@ -755,6 +755,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // KiCad DRC rule keys named in the pad guidance, not callable tools.
         "copper_edge_clearance",
         "lib_footprint_mismatch",
+        // Wiring refusal kind and response field (#98, #157), not callable
+        // tools.
+        "ambiguous_target",
+        "skipped_directions",
     ];
 
     let mut phantom = Vec::new();
